@@ -44,23 +44,3 @@ python3 public/kgb.py --self-test
 ```
 
 That writes the `.gba`, a `.png` of the icon when one is present, and a JSON file for the footer.
-
-## Put it on GitHub
-
-GitHub stores the code. It does not run this site by itself.
-
-1. On GitHub, choose **New repository**. Name it `kgb`. Leave “Add a README” off, because this file is already here.
-2. On your computer, in this project folder:
-
-```bash
-git init
-git add .
-git commit -m "Add KGB"
-git branch -M main
-git remote add origin https://github.com/YOUR_NAME/kgb.git
-git push -u origin main
-```
-
-`node_modules` is ignored. Run `npm install` again after a clone.
-
-To put the site on the internet, import that GitHub repo in [Vercel](https://vercel.com). The repo already has `vercel.json`. The build command is `npm run build`.
