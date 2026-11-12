@@ -1,0 +1,12 @@
+node_modules
+.vercel
+.output
+dist
+screenshots
+__pycache__
+*.pyc
+.env
+.env.*
+*.log
+.DS_Store
+kgb.zip
