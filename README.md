@@ -1,9 +1,8 @@
-<p align="center">
-  <img src="assets/banner.png" alt="KGB banner" width="100%">
+
 </p>
 <div align="center">
 
-# KGB
+## KGB
 
 **GBA ROMs out of 3DS Virtual Console `.cia` files, packed into DS `.nds` files, all in your browser.**
 
