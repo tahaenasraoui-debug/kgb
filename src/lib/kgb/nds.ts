@@ -1,5 +1,6 @@
 import { crc16 } from "./crc16.ts";
 import { readGbaHeader } from "./gba.ts";
+import { glyphRows5x7 } from "./font5x7.ts";
 import {
   BRASS,
   DUST,
@@ -10,9 +11,8 @@ import {
   expand555,
   renderCarrierScreens,
   rgb555,
-  type CarrierLabel,
 } from "./screen.ts";
-import { KgbError, type GbaHeader } from "./types.ts";
+import { KgbError, type CarrierLabel, type GbaHeader } from "./types.ts";
 
 /** 156-byte Nintendo logo required at NDS header 0xC0. CRC-16 must be 0xCF56. */
 export const NDS_LOGO = Uint8Array.of(
@@ -53,6 +53,16 @@ export type NdsInfo = {
   logoCrcOk: boolean;
   bannerTitle: string;
   bannerOffset: number;
+  bannerVersion: number;
+  bannerCrcOk: boolean;
+  arm9Offset: number;
+  arm9Size: number;
+  arm7Offset: number;
+  arm7Size: number;
+  fntOffset: number;
+  fntSize: number;
+  fatOffset: number;
+  fatSize: number;
   iconRgba: Uint8ClampedArray | null;
   files: NdsFile[];
   gba: EmbeddedGba | null;
@@ -75,6 +85,8 @@ export type CarrierInput = {
    * Omitted keeps the text seal (game code on a brass border).
    */
   bannerImage?: RgbaImage | null;
+  /** Embedded filename in carrier filesystem (default "rom.gba"). */
+  romFileName?: string;
 };
 
 function u16(data: Uint8Array, off: number): number {
@@ -162,10 +174,12 @@ function encodeArm(ops: ArmOp[], pool: Record<string, number>): { code: Uint8Arr
     let word = 0;
     if (op.op === "ldr") {
       const slot = poolKeys.indexOf(op.key);
+      if (slot < 0) throw new Error(`Literal pool is missing key "${op.key}".`);
       const imm = flat.length * 4 + slot * 4 - (addr + 8);
       if (imm < 0 || imm > 0xfff) throw new Error(`Literal pool is out of reach (${imm}).`);
       word = 0xe59f0000 | (op.rd << 12) | (imm & 0xfff);
     } else if (op.op === "mov") {
+      if (op.imm < 0 || op.imm > 0xff) throw new Error(`MOV immediate ${op.imm} is not encodable.`);
       word = 0xe3a00000 | (op.rd << 12) | (op.imm & 0xff);
     } else if (op.op === "str") {
       word = 0xe5800000 | (op.rn << 16) | (op.rd << 12);
@@ -176,6 +190,7 @@ function encodeArm(ops: ArmOp[], pool: Record<string, number>): { code: Uint8Arr
     } else if (op.op === "ldrp") {
       word = 0xe4b00000 | (op.rn << 16) | (op.rd << 12) | (op.imm & 0xfff);
     } else if (op.op === "subs") {
+      if (op.imm < 0 || op.imm > 0xff) throw new Error(`SUBS immediate ${op.imm} is not encodable.`);
       word = 0xe2500000 | (op.rn << 16) | (op.rd << 12) | (op.imm & 0xff);
     } else if (op.op === "b") {
       const target = labels[op.target] ?? 0;
@@ -348,45 +363,7 @@ export function runArm9Blit(arm9: Uint8Array): { top: Uint8Array; bottom: Uint8A
 const ICON_PALETTE = [INK, BRASS, PAPER, STAMP, DUST, rgb555(0x17, 0x19, 0x10)];
 
 function glyphBits(ch: string): number[] {
-  const rows: Record<string, number[]> = {
-    A: [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-    B: [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-    C: [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-    D: [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-    E: [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-    F: [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-    G: [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
-    H: [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-    I: [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-    J: [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
-    K: [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-    L: [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-    M: [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-    N: [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-    O: [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-    P: [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-    Q: [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-    R: [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-    S: [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-    T: [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-    U: [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-    V: [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-    W: [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
-    X: [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-    Y: [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-    Z: [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-    "0": [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-    "1": [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-    "2": [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-    "3": [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-    "4": [0b10010, 0b10010, 0b10010, 0b11111, 0b00010, 0b00010, 0b00010],
-    "5": [0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110],
-    "6": [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-    "7": [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-    "8": [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-    "9": [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
-  };
-  return rows[ch] ?? [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111];
+  return glyphRows5x7(ch);
 }
 
 function stampIcon(code: string): Uint8Array {
@@ -697,8 +674,8 @@ export function installBannerIcon(source: Uint8Array, image: RgbaImage): Uint8Ar
   return rom;
 }
 
-function buildFnt(): Uint8Array {
-  const names = ["rom.gba", "readme.txt"];
+function buildFnt(romFileName = "rom.gba"): Uint8Array {
+  const names = [romFileName, "readme.txt"];
   let nameBytes = 1;
   for (const name of names) nameBytes += 1 + name.length;
   const fnt = new Uint8Array(8 + nameBytes);
@@ -721,6 +698,7 @@ function deviceCapacity(bytes: number): number {
     cap *= 2;
     n++;
   }
+  if (cap < bytes) throw new KgbError(`That file is too large for an NDS cartridge (${bytes} bytes).`);
   return n;
 }
 
@@ -745,10 +723,15 @@ export function packGbaAsNds(input: CarrierInput): Uint8Array {
   const screens = renderCarrierScreens(label);
   const arm9 = buildArm9Image(screens.top, screens.bottom);
   const arm7 = Uint8Array.of(0xfe, 0xff, 0xff, 0xea);
-  const fnt = buildFnt();
+  const romFileName = input.romFileName || "rom.gba";
+  const fnt = buildFnt(romFileName);
   const bannerIcon = input.bannerImage ? quantizeToBanner(input.bannerImage) : null;
   const banner = buildBanner(label.title, label.gameCode, bannerIcon);
-  const readme = new TextEncoder().encode(CARRIER_README);
+  const readmeText =
+    romFileName === "rom.gba"
+      ? CARRIER_README
+      : `KGB NDS carrier\nThis is not a port. ${romFileName} is the original ROM image, byte for byte.\nBooting this file only shows the label. Extract ${romFileName} to play.\n`;
+  const readme = new TextEncoder().encode(readmeText);
 
   let cursor = 0x4000;
   const arm9Off = cursor;
@@ -900,11 +883,23 @@ export function parseNds(source: ArrayBuffer | Uint8Array, fileName: string): Nd
 
   let bannerTitle = "";
   let iconRgba: Uint8ClampedArray | null = null;
+  let bannerVersion = 0;
+  let bannerCrcOk = false;
   const bannerOff = u32(rom, 0x68);
   if (bannerOff >= 0x200 && bannerOff + 0x840 <= rom.length) {
-    const banner = rom.subarray(bannerOff, bannerOff + 0x840);
-    const expect = crc16(banner, 0x20, 0x840);
-    if (expect !== u16(banner, 2)) warnings.push("Banner CRC does not match. The icon may be garbled.");
+    const banner = rom.subarray(bannerOff, Math.min(bannerOff + 0xa40, rom.length));
+    bannerVersion = u16(banner, 0) & 0xff;
+    const span = bannerVersion >= 3 && banner.length >= 0xa40 ? 0xa40 : bannerVersion >= 2 && banner.length >= 0x940 ? 0x940 : 0x840;
+    const expect = crc16(banner, 0x20, span);
+    const stored = u16(banner, 2);
+    bannerCrcOk = expect === stored;
+    if (!bannerCrcOk) warnings.push("Banner CRC does not match. The icon may be garbled.");
+    if (bannerVersion >= 2 && banner.length >= 0x940 && crc16(banner, 0x20, 0x940) !== u16(banner, 4)) {
+      warnings.push("Banner v2 CRC does not match.");
+    }
+    if (bannerVersion >= 3 && banner.length >= 0xa40 && crc16(banner, 0x20, 0xa40) !== u16(banner, 6)) {
+      warnings.push("Banner v3 CRC does not match.");
+    }
     bannerTitle = readUtf16(banner, 0x340) || readUtf16(banner, 0x240);
     iconRgba = decodeBannerIcon(banner);
   } else {
@@ -930,6 +925,16 @@ export function parseNds(source: ArrayBuffer | Uint8Array, fileName: string): Nd
     logoCrcOk,
     bannerTitle,
     bannerOffset: bannerOff,
+    bannerVersion,
+    bannerCrcOk,
+    arm9Offset: u32(rom, 0x20),
+    arm9Size: u32(rom, 0x2c),
+    arm7Offset: u32(rom, 0x30),
+    arm7Size: u32(rom, 0x3c),
+    fntOffset: u32(rom, 0x40),
+    fntSize: u32(rom, 0x44),
+    fatOffset: u32(rom, 0x48),
+    fatSize: u32(rom, 0x4c),
     iconRgba,
     files,
     gba,

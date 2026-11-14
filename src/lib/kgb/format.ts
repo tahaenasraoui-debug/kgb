@@ -61,19 +61,20 @@ export function utf16le(data: Uint8Array, start: number, bytes: number): string 
 
 export function sanitizeFile(name: string): string {
   const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
-  return cleaned.length > 0 ? cleaned.slice(0, 80) : "extracted";
+  if (cleaned.length === 0) return "extracted";
+  return Array.from(cleaned).slice(0, 80).join("");
 }
 
-export function romDownloadName(gbaTitle: string, gameCode: string): string {
-  const title = sanitizeFile(gbaTitle || "untitled");
-  const code = sanitizeFile(gameCode || "----");
-  return `${title} [${code}].gba`;
+export function romDownloadName(title: string, gameCode: string, ext = "gba"): string {
+  const cleanTitle = sanitizeFile(title || "untitled");
+  const cleanCode = sanitizeFile(gameCode || "----");
+  return `${cleanTitle} [${cleanCode}].${ext}`;
 }
 
-export function ndsDownloadName(gbaTitle: string, gameCode: string): string {
-  const title = sanitizeFile(gbaTitle || "untitled");
-  const code = sanitizeFile(gameCode || "----");
-  return `${title} [${code}].nds`;
+export function ndsDownloadName(title: string, gameCode: string): string {
+  const cleanTitle = sanitizeFile(title || "untitled");
+  const cleanCode = sanitizeFile(gameCode || "----");
+  return `${cleanTitle} [${cleanCode}].nds`;
 }
 
 export function ghostingLabel(value: number): string {
@@ -90,15 +91,36 @@ export function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
-export function trimTrailingFf(rom: Uint8Array): { bytes: Uint8Array; trimmed: number } {
+export function trimTrailingFf(rom: Uint8Array, minSize = 0): { bytes: Uint8Array; trimmed: number } {
+  const floor = Math.max(0xc0, minSize);
   let end = rom.length;
-  while (end > 0xc0 && rom[end - 1] === 0xff) end--;
-  if (end === rom.length) return { bytes: rom, trimmed: 0 };
+  while (end > floor && rom[end - 1] === 0xff) end--;
+  if (end === rom.length || (minSize > 0 && end <= minSize) || (rom.length - end < 16 && minSize === 0)) {
+    return { bytes: rom, trimmed: 0 };
+  }
   return { bytes: rom.slice(0, end), trimmed: rom.length - end };
 }
 
 export function dossierLog(d: Dossier): string[] {
   const o = d.offsets;
+  if ((d.system === "gb" || d.system === "gbc") && d.gb) {
+    const gb = d.gb;
+    const lines = [
+      `FILE  ${d.fileName}  ${formatBytes(d.fileSize)}`,
+      `CIA   header ${hex(o.ciaHeader)}   cert ${hex(o.certSize, 4)}  ticket ${hex(o.ticketSize, 4)}  tmd ${hex(o.tmdSize, 4)}`,
+      `NCCH  ${hex(o.ncch)}   magic OK   title ${d.titleId}`,
+      `FLAG  ${d.encrypted ? "CRYPTO SET — payload may be ciphertext" : "NoCrypto (flags[7] bit2)"}   product ${d.productCode || "—"}`,
+      `ROMFS Media offset ${hex(o.romInFile)}`,
+      `GB    "${gb.title}"  Type: ${gb.cartridgeTypeName}  Dest: ${gb.destination}`,
+      `CGB   ${gb.cgbOnly ? "Color only (0xC0)" : gb.cgbSupported ? "Enhanced (0x80)" : "Monochrome DMG (0x00)"}`,
+      `SIZE  ROM ${formatBytes(gb.romSizeBytes)} (${gb.romSizeCode})  RAM ${formatBytes(gb.ramSizeBytes)} (${gb.ramSizeCode})`,
+      `CHK   Checksum ${hex(gb.headerChecksum, 2)} ${gb.checksumOk ? "OK" : "BAD"}  Logo ${gb.logoOk ? "OK" : "BAD"}`,
+      `OUT   ${formatBytes(d.rom.length)} Game Boy ROM`,
+    ];
+    for (const w of d.warnings) lines.push(`WARN  ${w}`);
+    return lines;
+  }
+
   const lines = [
     `FILE  ${d.fileName}  ${formatBytes(d.fileSize)}`,
     `CIA   header ${hex(o.ciaHeader)}   cert ${hex(o.certSize, 4)}  ticket ${hex(o.ticketSize, 4)}  tmd ${hex(o.tmdSize, 4)}`,
@@ -118,9 +140,10 @@ export function dossierLog(d: Dossier): string[] {
 }
 
 export function caaJson(d: Dossier, trimmed: boolean, outSize: number): string {
-  const lut = hexBytes(d.caa.videoLut).replace(/ /g, "");
+  const lut = d.caa ? hexBytes(d.caa.videoLut).replace(/ /g, "") : "";
   const body = {
     tool: "KGB",
+    system: d.system || "gba",
     title_id: d.titleId,
     product_code: d.productCode,
     encrypted: d.encrypted,
@@ -137,6 +160,7 @@ export function caaJson(d: Dossier, trimmed: boolean, outSize: number): string {
       rom_in_file: d.offsets.romInFile,
       smdh_icon_in_file: d.offsets.iconInFile,
     },
+    gb: d.gb || null,
     gba: {
       title: d.gba.title,
       game_code: d.gba.gameCode,
@@ -149,24 +173,26 @@ export function caaJson(d: Dossier, trimmed: boolean, outSize: number): string {
       trimmed_trailing_ff: trimmed,
       download_size: outSize,
     },
-    caa: {
-      magic: d.caa.magicOk ? ".CAA" : null,
-      version: d.caa.version,
-      rom_size: d.caa.romSize,
-      rom_size_trusted: d.romSizeFieldTrusted,
-      save_type: d.caa.save.id,
-      save_type_name: d.caa.save.name,
-      save_alias: d.caa.save.alias,
-      save_bytes: d.caa.save.bytes,
-      rtc: d.caa.save.rtc,
-      lcd_ghosting: d.caa.lcdGhosting,
-      sleep_combo: d.caa.sleepCombo,
-      flash_eeprom_config_hex: d.caa.flashConfigHex,
-      descriptor_offset: d.caa.descriptorOffset,
-      descriptor_count_shifted: d.caa.descriptorCountShifted,
-      video_lut_hex: lut,
-      footer_hex: hexBytes(d.caa.footer).replace(/ /g, ""),
-    },
+    caa: d.caa?.magicOk
+      ? {
+          magic: ".CAA",
+          version: d.caa.version,
+          rom_size: d.caa.romSize,
+          rom_size_trusted: d.romSizeFieldTrusted,
+          save_type: d.caa.save.id,
+          save_type_name: d.caa.save.name,
+          save_alias: d.caa.save.alias,
+          save_bytes: d.caa.save.bytes,
+          rtc: d.caa.save.rtc,
+          lcd_ghosting: d.caa.lcdGhosting,
+          sleep_combo: d.caa.sleepCombo,
+          flash_eeprom_config_hex: d.caa.flashConfigHex,
+          descriptor_offset: d.caa.descriptorOffset,
+          descriptor_count_shifted: d.caa.descriptorCountShifted,
+          video_lut_hex: lut,
+          footer_hex: hexBytes(d.caa.footer).replace(/ /g, ""),
+        }
+      : null,
     smdh: d.smdh,
   };
   return JSON.stringify(body, null, 2);

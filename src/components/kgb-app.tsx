@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Download, FileCode2, Terminal, TriangleAlert } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Gamepad2, Terminal } from "lucide-react";
+import { useSha256 } from "@/hooks/use-sha256";
+import { assetUrl, downloadBlob, extensionOf, rgbaToPng } from "@/lib/download";
+import { readImageFile } from "@/lib/image-file";
 import {
   caaJson,
-  dossierLog,
   formatBytes,
-  ghostingLabel,
-  hex,
-  ndsDownloadName,
   romDownloadName,
+  ndsDownloadName,
   trimTrailingFf,
 } from "@/lib/kgb/format";
 import { readGbaHeader } from "@/lib/kgb/gba";
+import { matchGbLogo } from "@/lib/kgb/gb";
+import { buildGoombaGba, loadGoombaBase } from "@/lib/kgb/goomba";
 import {
   installBannerIcon,
   isNdsRom,
@@ -22,112 +24,160 @@ import {
   type NdsInfo,
   type RgbaImage,
 } from "@/lib/kgb/nds";
-import { parseCia } from "@/lib/kgb/parse";
-import { expand555, renderCarrierScreens, type CarrierLabel } from "@/lib/kgb/screen";
+import { parseCia, parseGbFile } from "@/lib/kgb/parse";
+import { renderCarrierScreens, type CarrierLabel } from "@/lib/kgb/screen";
 import { KgbError, type Dossier } from "@/lib/kgb/types";
+import {
+  cancelKgbWork,
+  packNdsAsync,
+  parseCiaAsync,
+  parseNdsAsync,
+  workerSupported,
+} from "@/lib/kgb/work-client";
+import { TabButton } from "./kgb/primitives";
+import {
+  CarrierPanel,
+  CiaView,
+  CliPanel,
+  GbaView,
+  NdsView,
+  QueueBar,
+} from "./kgb/panels";
+import { EmulatorPlayer } from "./kgb/emulator-player";
 
-type Tab = "dossier" | "cli";
-type Loaded =
-  | { kind: "cia"; dossier: Dossier }
-  | { kind: "gba"; fileName: string; rom: Uint8Array }
-  | { kind: "nds"; info: NdsInfo; rom: Uint8Array };
+type Tab = "dossier" | "cli" | "player";
+type Entry =
+  | { id: number; kind: "cia"; name: string; dossier: Dossier }
+  | { id: number; kind: "gba"; name: string; rom: Uint8Array }
+  | { id: number; kind: "nds"; name: string; info: NdsInfo; rom: Uint8Array };
 
-function downloadBlob(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(url);
+type ErrShape = { message: string; warnings: string[]; partial: Partial<Dossier> | null };
+
+const MAX_QUEUE = 20;
+const MAX_FILE_BYTES = 256 * 1024 * 1024;
+
+let entrySeq = 0;
+
+function toErrShape(err: unknown): ErrShape {
+  if (err instanceof KgbError) return { message: err.message, warnings: err.warnings, partial: err.partial };
+  const e = err as { message?: string; warnings?: string[]; partial?: Partial<Dossier> | null; name?: string };
+  if (e && e.name === "KgbError") {
+    return {
+      message: e.message ?? "Could not read that file.",
+      warnings: Array.isArray(e.warnings) ? e.warnings : [],
+      partial: (e.partial as Partial<Dossier> | null) ?? null,
+    };
+  }
+  return {
+    message: err instanceof Error ? err.message : "Could not read that file.",
+    warnings: [],
+    partial: null,
+  };
 }
 
-function rgbaToPng(rgba: Uint8ClampedArray, size: number): Promise<Blob> {
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return Promise.reject(new Error("Canvas is unavailable."));
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), size, size), 0, 0);
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("PNG encode failed."))), "image/png");
-  });
-}
-
-function readImageFile(file: File): Promise<RgbaImage> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const limit = 256;
-      const scale = Math.min(1, limit / Math.max(img.width, img.height, 1));
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(img.width * scale));
-      canvas.height = Math.max(1, Math.round(img.height * scale));
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        URL.revokeObjectURL(url);
-        reject(new Error("Canvas is unavailable."));
-        return;
+async function parseCiaSmart(buffer: ArrayBuffer, name: string): Promise<Dossier> {
+  if (workerSupported()) {
+    try {
+      const { dossier } = await parseCiaAsync(buffer, name);
+      return dossier;
+    } catch (err) {
+      if ((err as Error).message === "Worker unavailable." && buffer.byteLength > 0) {
+        return parseCia(buffer, name);
       }
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-      resolve({ rgba: data.data, width: canvas.width, height: canvas.height });
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("That picture could not be read."));
-    };
-    img.src = url;
-  });
+      throw err;
+    }
+  }
+  return parseCia(buffer, name);
 }
 
-function extensionOf(name: string): string {
-  return name.split(".").pop()?.toLowerCase() ?? "";
+async function parseNdsSmart(
+  buffer: ArrayBuffer,
+  name: string,
+): Promise<{ info: NdsInfo; rom: Uint8Array }> {
+  if (workerSupported()) {
+    try {
+      return await parseNdsAsync(buffer, name);
+    } catch (err) {
+      if ((err as Error).message === "Worker unavailable." && buffer.byteLength > 0) {
+        const bytes = new Uint8Array(buffer);
+        return { info: parseNds(bytes, name), rom: bytes };
+      }
+      throw err;
+    }
+  }
+  const bytes = new Uint8Array(buffer);
+  return { info: parseNds(bytes, name), rom: bytes };
+}
+
+async function packNdsSmart(
+  rom: Uint8Array,
+  input: Omit<Parameters<typeof packGbaAsNds>[0], "rom">,
+): Promise<Uint8Array> {
+  if (workerSupported()) {
+    try {
+      const { nds } = await packNdsAsync(rom, input);
+      return nds;
+    } catch (err) {
+      if ((err as Error).message === "Worker unavailable." || (err as Error).message === "Worker crashed.") {
+        return packGbaAsNds({ ...input, rom });
+      }
+      throw err;
+    }
+  }
+  return packGbaAsNds({ ...input, rom });
 }
 
 export function KgbApp() {
-  const [loaded, setLoaded] = useState<Loaded | null>(null);
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [activeId, setActiveId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [errorNotes, setErrorNotes] = useState<string[]>([]);
+  const [errorPartial, setErrorPartial] = useState<Partial<Dossier> | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
   const [trim, setTrim] = useState(false);
   const [tab, setTab] = useState<Tab>("dossier");
-  const [sha, setSha] = useState("");
   const [script, setScript] = useState("");
+  const [scriptError, setScriptError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [headerIcon, setHeaderIcon] = useState(true);
   const [pickedIcon, setPickedIcon] = useState<{ name: string; image: RgbaImage } | null>(null);
   const [iconNote, setIconNote] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const busyRef = useRef(false);
 
-  const dossier = loaded?.kind === "cia" ? loaded.dossier : null;
-  const trimmed = useMemo(() => (dossier ? trimTrailingFf(dossier.rom) : null), [dossier]);
+  const active = entries.find((e) => e.id === activeId) ?? null;
+  const dossier = active?.kind === "cia" ? active.dossier : null;
+  const trimmed = useMemo(() => {
+    if (!dossier) return null;
+    const minSize = dossier.gb?.romSizeBytes ?? 0;
+    return trimTrailingFf(dossier.rom, minSize);
+  }, [dossier]);
   const ciaRom = trim && trimmed ? trimmed.bytes : dossier?.rom;
   const trimmedCount = trimmed?.trimmed ?? 0;
 
   const carryRom = useMemo(() => {
-    if (loaded?.kind === "cia") return ciaRom ?? null;
-    if (loaded?.kind === "gba") return loaded.rom;
-    if (loaded?.kind === "nds") return loaded.info.gba?.rom ?? null;
+    if (active?.kind === "cia") return ciaRom ?? null;
+    if (active?.kind === "gba") return active.rom;
+    if (active?.kind === "nds") return active.info.gba?.rom ?? null;
     return null;
-  }, [loaded, ciaRom]);
+  }, [active, ciaRom]);
 
   const carryLabel = useMemo<CarrierLabel | null>(() => {
     if (!carryRom) return null;
-    if (loaded?.kind === "cia" && dossier) {
+    if (active?.kind === "cia" && dossier) {
       return {
-        title: dossier.smdh?.short || dossier.gba.title,
+        title: dossier.smdh?.short || dossier.gb?.title || dossier.gba.title,
         gameCode: dossier.gba.gameCode,
         maker: dossier.gba.maker,
         version: dossier.gba.version,
         bytes: carryRom.length,
-        checksumOk: dossier.gba.checksumOk,
+        checksumOk: dossier.gb ? dossier.gb.checksumOk : dossier.gba.checksumOk,
         iconRgba: dossier.iconRgba,
       };
     }
-    if (loaded?.kind === "gba") {
-      const header = readGbaHeader(loaded.rom);
+    if (active?.kind === "gba") {
+      const header = readGbaHeader(active.rom);
       return {
         title: header.title,
         gameCode: header.gameCode,
@@ -138,8 +188,8 @@ export function KgbApp() {
         iconRgba: null,
       };
     }
-    if (loaded?.kind === "nds" && loaded.info.gba) {
-      const header = loaded.info.gba.header;
+    if (active?.kind === "nds" && active.info.gba) {
+      const header = active.info.gba.header;
       return {
         title: header.title,
         gameCode: header.gameCode,
@@ -147,11 +197,38 @@ export function KgbApp() {
         version: header.version,
         bytes: carryRom.length,
         checksumOk: header.checksumOk,
-        iconRgba: loaded.info.iconRgba,
+        iconRgba: active.info.iconRgba,
       };
     }
     return null;
-  }, [carryRom, dossier, loaded]);
+  }, [carryRom, dossier, active]);
+
+  const playable = useMemo(() => {
+    if (!active) return null;
+    if (active.kind === "cia") {
+      return {
+        rom: active.dossier.rom,
+        title: active.dossier.smdh?.short || active.dossier.gb?.title || active.dossier.gba.title || "Game",
+        system: (active.dossier.system || "gba") as "gba" | "gb" | "gbc",
+      };
+    }
+    if (active.kind === "gba") {
+      const header = readGbaHeader(active.rom);
+      return {
+        rom: active.rom,
+        title: header.title || active.name.replace(/\.[^.]+$/, ""),
+        system: "gba" as const,
+      };
+    }
+    if (active.kind === "nds" && active.info.gba) {
+      return {
+        rom: active.info.gba.rom,
+        title: active.info.gba.header.title || active.name.replace(/\.[^.]+$/, ""),
+        system: "gba" as const,
+      };
+    }
+    return null;
+  }, [active]);
 
   const screens = useMemo(() => (carryLabel ? renderCarrierScreens(carryLabel) : null), [carryLabel]);
 
@@ -164,120 +241,234 @@ export function KgbApp() {
     [bannerSource, carryLabel],
   );
 
-  useEffect(() => {
-    if (!carryRom) {
-      setSha("");
-      return;
-    }
-    let cancel = false;
-    crypto.subtle.digest("SHA-256", new Uint8Array(carryRom)).then((buf) => {
-      if (cancel) return;
-      setSha(Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join(""));
-    });
-    return () => {
-      cancel = true;
-    };
-  }, [carryRom]);
+  const sha = useSha256(carryRom);
 
   useEffect(() => {
-    if (tab !== "cli" || script) return;
-    fetch("/kgb.py")
-      .then((r) => r.text())
-      .then(setScript)
-      .catch(() => setScript("The script could not be loaded."));
-  }, [tab, script]);
+    return () => {
+      cancelKgbWork();
+    };
+  }, []);
+
+  function loadScript() {
+    setScriptError(null);
+    fetch(assetUrl("kgb.py"))
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
+      .then((text) => {
+        setScript(text);
+        setScriptError(null);
+      })
+      .catch(() => setScriptError("The script could not be loaded."));
+  }
+
+  useEffect(() => {
+    if (tab !== "cli" || script || scriptError) return;
+    loadScript();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   function fail(err: unknown) {
-    setLoaded(null);
-    if (err instanceof KgbError) {
-      setError(err.message);
-      setErrorNotes(err.warnings);
-    } else {
-      setError(err instanceof Error ? err.message : "Could not read that file.");
-      setErrorNotes([]);
-    }
+    const shaped = toErrShape(err);
+    if (shaped.message === "Cancelled.") return;
+    setError(shaped.message);
+    setErrorNotes(shaped.warnings);
+    setErrorPartial(shaped.partial);
   }
 
-  function ingest(buffer: ArrayBuffer, name: string) {
+  async function ingestOne(file: File): Promise<Entry> {
+    if (file.size > MAX_FILE_BYTES) {
+      throw new KgbError(
+        `"${file.name}" is ${formatBytes(file.size)} — please use a file under 256 MiB.`,
+      );
+    }
+    const buf = await file.arrayBuffer();
+    // Magic wins over the extension: renamed files still route correctly.
+    const peek = new Uint8Array(buf);
+    if (isNdsRom(peek)) {
+      const { info, rom } = await parseNdsSmart(buf, file.name);
+      return { id: ++entrySeq, kind: "nds", name: file.name, info, rom };
+    }
+    if (looksLikeGba(peek)) {
+      if (peek.length < 0xc0) throw new KgbError("That file is too small to be a GBA game.");
+      return { id: ++entrySeq, kind: "gba", name: file.name, rom: new Uint8Array(buf) };
+    }
+    const ext = extensionOf(file.name);
+    if (ext === "nds" || ext === "srl") {
+      throw new KgbError("Not an NDS cartridge. The Nintendo logo at 0xC0 never matched.");
+    }
+    if (ext === "gba" || ext === "agb") {
+      if (peek.length < 0xc0) throw new KgbError("That file is too small to be a GBA game.");
+      return { id: ++entrySeq, kind: "gba", name: file.name, rom: new Uint8Array(buf) };
+    }
+    if (ext === "gb" || ext === "gbc" || matchGbLogo(peek, 0x104)) {
+      if (peek.length < 0x150) throw new KgbError("That file is too small to be a Game Boy ROM.");
+      const dossier = parseGbFile(buf, file.name);
+      return { id: ++entrySeq, kind: "cia", name: file.name, dossier };
+    }
+    const dossier = await parseCiaSmart(buf, file.name);
+    return { id: ++entrySeq, kind: "cia", name: file.name, dossier };
+  }
+
+  async function onFiles(list: FileList | File[] | null | undefined) {
+    if (!list) return;
+    const files = Array.from(list);
+    if (files.length === 0) return;
+    const room = MAX_QUEUE - entries.length;
+    if (room <= 0) {
+      setError(`The queue holds ${MAX_QUEUE} files. Remove one first.`);
+      setErrorNotes([]);
+      setErrorPartial(null);
+      return;
+    }
+    const batch = files.slice(0, room);
     setError(null);
     setErrorNotes([]);
+    setErrorPartial(null);
     setPickedIcon(null);
     setIconNote(null);
-    const bytes = new Uint8Array(buffer);
-    const ext = extensionOf(name);
+    setBusy(`Reading ${batch.length > 1 ? `${batch.length} files` : batch[0]?.name ?? "file"}…`);
+    busyRef.current = true;
     try {
-      if (ext === "nds" || ext === "srl" || (ext !== "cia" && ext !== "cxi" && ext !== "gba" && ext !== "agb" && isNdsRom(bytes))) {
-        setLoaded({ kind: "nds", info: parseNds(buffer, name), rom: bytes });
-        setTab("dossier");
-        return;
+      const made: Entry[] = [];
+      const errors: string[] = [];
+      for (const file of batch) {
+        try {
+          // Sequential: keeps peak memory to one file at a time.
+          made.push(await ingestOne(file));
+        } catch (err) {
+          const shaped = toErrShape(err);
+          if (shaped.message === "Cancelled.") break;
+          errors.push(`"${file.name}": ${shaped.message}`);
+        }
+        if (!busyRef.current) break;
       }
-      if (ext === "gba" || ext === "agb" || (ext !== "cia" && ext !== "cxi" && looksLikeGba(bytes))) {
-        if (bytes.length < 0xc0) throw new KgbError("That file is too small to be a GBA game.");
-        setLoaded({ kind: "gba", fileName: name, rom: bytes });
+      if (made.length > 0) {
+        setEntries((prev) => [...prev, ...made].slice(-MAX_QUEUE));
+        setActiveId(made[made.length - 1]!.id);
         setTab("dossier");
-        return;
       }
-      setLoaded({ kind: "cia", dossier: parseCia(buffer, name) });
-      setTab("dossier");
+      const notes: string[] = [];
+      if (files.length > batch.length) {
+        notes.push(`Only ${batch.length} files were queued (max ${MAX_QUEUE}).`);
+      }
+      if (errors.length > 0) {
+        setError(errors.length === 1 ? errors[0]! : `${errors.length} files could not be read.`);
+        setErrorNotes([...notes, ...(errors.length > 1 ? errors : [])]);
+      } else if (notes.length > 0) {
+        setError("Queue limit reached.");
+        setErrorNotes(notes);
+      }
     } catch (err) {
       fail(err);
+    } finally {
+      busyRef.current = false;
+      setBusy(null);
     }
   }
 
-  function onFile(file: File | undefined) {
-    if (!file) return;
-    file.arrayBuffer().then((buf) => ingest(buf, file.name));
+  function cancelBusy() {
+    busyRef.current = false;
+    cancelKgbWork();
+    setBusy(null);
   }
 
-  function saveRom() {
+  async function saveRomExt(ext: "gb" | "gbc" | "gba") {
     if (!dossier || !ciaRom) return;
-    downloadBlob(new Blob([new Uint8Array(ciaRom)]), romDownloadName(dossier.gba.title, dossier.gba.gameCode));
+    const title = dossier.gb?.title || dossier.gba.title;
+    const code = dossier.gba.gameCode;
+    if (ext === "gba" && (dossier.system === "gb" || dossier.system === "gbc")) {
+      setBusy("Packing .gba (Goomba runner)…");
+      busyRef.current = true;
+      try {
+        const goombaBase = await loadGoombaBase();
+        const gbaBytes = buildGoombaGba(goombaBase, ciaRom, title);
+        downloadBlob(new Blob([new Uint8Array(gbaBytes)]), romDownloadName(title, code, "gba"));
+      } catch (err: unknown) {
+        fail(err);
+      } finally {
+        busyRef.current = false;
+        setBusy(null);
+      }
+      return;
+    }
+    downloadBlob(new Blob([new Uint8Array(ciaRom)]), romDownloadName(title, code, ext));
   }
 
   function saveJson() {
     if (!dossier || !ciaRom) return;
+    const title = dossier.gb?.title || dossier.gba.title;
+    const code = dossier.gba.gameCode;
     const body = caaJson(dossier, trim && trimmedCount > 0, ciaRom.length);
-    const stem = romDownloadName(dossier.gba.title, dossier.gba.gameCode).replace(/\.gba$/, "");
+    const stem = romDownloadName(title, code, "rom").replace(/\.rom$/, "");
     downloadBlob(new Blob([body], { type: "application/json" }), `${stem}.caa.json`);
   }
 
   function saveFooter() {
     if (!dossier) return;
-    const stem = romDownloadName(dossier.gba.title, dossier.gba.gameCode).replace(/\.gba$/, "");
+    const title = dossier.gb?.title || dossier.gba.title;
+    const code = dossier.gba.gameCode;
+    const stem = romDownloadName(title, code, "rom").replace(/\.rom$/, "");
     downloadBlob(new Blob([new Uint8Array(dossier.caa.footer)]), `${stem}.caa.bin`);
   }
 
   async function saveIcon() {
     if (!dossier?.iconRgba) return;
-    const stem = romDownloadName(dossier.gba.title, dossier.gba.gameCode).replace(/\.gba$/, "");
+    const title = dossier.gb?.title || dossier.gba.title;
+    const code = dossier.gba.gameCode;
+    const stem = romDownloadName(title, code, "rom").replace(/\.rom$/, "");
     downloadBlob(await rgbaToPng(dossier.iconRgba, 48), `${stem}.png`);
   }
 
-  function saveNds() {
+  async function saveNds() {
     if (!carryRom || !carryLabel) return;
-    const nds = packGbaAsNds({
-      rom: carryRom,
-      title: carryLabel.title,
-      gameCode: carryLabel.gameCode,
-      maker: carryLabel.maker,
-      version: carryLabel.version,
-      checksumOk: carryLabel.checksumOk,
-      iconRgba: carryLabel.iconRgba,
-      bannerImage: bannerSource,
-    });
-    downloadBlob(new Blob([new Uint8Array(nds)]), ndsDownloadName(carryLabel.title, carryLabel.gameCode));
+    setBusy("Packing .nds…");
+    busyRef.current = true;
+    try {
+      const romFileName =
+        dossier?.system === "gb"
+          ? "rom.gb"
+          : dossier?.system === "gbc"
+            ? "rom.gbc"
+            : "rom.gba";
+      const nds = await packNdsSmart(carryRom, {
+        title: carryLabel.title,
+        gameCode: carryLabel.gameCode,
+        maker: carryLabel.maker,
+        version: carryLabel.version,
+        checksumOk: carryLabel.checksumOk,
+        iconRgba: carryLabel.iconRgba,
+        bannerImage: bannerSource,
+        romFileName,
+      });
+      downloadBlob(new Blob([new Uint8Array(nds)]), ndsDownloadName(carryLabel.title, carryLabel.gameCode));
+      try {
+        const info = parseNds(nds, ndsDownloadName(carryLabel.title, carryLabel.gameCode));
+        const entry: Entry = { id: ++entrySeq, kind: "nds", name: info.fileName, info, rom: nds };
+        setEntries((prev) => [...prev, entry].slice(-MAX_QUEUE));
+        setActiveId(entry.id);
+      } catch {
+        /* download already succeeded; queueing is best-effort */
+      }
+    } catch (err) {
+      fail(err);
+    } finally {
+      busyRef.current = false;
+      setBusy(null);
+    }
   }
 
   function saveEmbeddedGba() {
-    if (loaded?.kind !== "nds" || !loaded.info.gba) return;
-    const header = loaded.info.gba.header;
-    downloadBlob(new Blob([new Uint8Array(loaded.info.gba.rom)]), romDownloadName(header.title, header.gameCode));
+    if (active?.kind !== "nds" || !active.info.gba) return;
+    const header = active.info.gba.header;
+    downloadBlob(new Blob([new Uint8Array(active.info.gba.rom)]), romDownloadName(header.title, header.gameCode));
   }
 
   async function saveBannerIcon() {
-    if (loaded?.kind !== "nds" || !loaded.info.iconRgba) return;
-    const stem = ndsDownloadName(loaded.info.title, loaded.info.gameCode).replace(/\.nds$/, "");
-    downloadBlob(await rgbaToPng(loaded.info.iconRgba, 32), `${stem}.png`);
+    if (active?.kind !== "nds" || !active.info.iconRgba) return;
+    const stem = ndsDownloadName(active.info.title, active.info.gameCode).replace(/\.nds$/, "");
+    downloadBlob(await rgbaToPng(active.info.iconRgba, 32), `${stem}.png`);
   }
 
   function onPickIcon(file: File) {
@@ -293,17 +484,62 @@ export function KgbApp() {
   }
 
   function savePatchedNds() {
-    if (loaded?.kind !== "nds" || !pickedIcon) return;
+    if (active?.kind !== "nds" || !pickedIcon) return;
     try {
-      const patched = installBannerIcon(loaded.rom, pickedIcon.image);
-      const base = loaded.info.fileName.replace(/\.(nds|srl)$/i, "") || "cartridge";
+      const patched = installBannerIcon(active.rom, pickedIcon.image);
+      const base = active.info.fileName.replace(/\.(nds|srl)$/i, "") || "cartridge";
       const name = `${base}.icon.nds`;
       downloadBlob(new Blob([new Uint8Array(patched)]), name);
-      setLoaded({ kind: "nds", info: parseNds(patched, name), rom: patched });
+      const info = parseNds(patched, name);
+      const entry: Entry = { id: ++entrySeq, kind: "nds", name, info, rom: patched };
+      setEntries((prev) => [...prev, entry].slice(-MAX_QUEUE));
+      setActiveId(entry.id);
       setPickedIcon(null);
       setIconNote(null);
     } catch (err) {
       setIconNote(err instanceof Error ? err.message : "The header could not take that icon.");
+    }
+  }
+
+  function downloadNdsFile(index: number) {
+    if (active?.kind !== "nds") return;
+    const file = active.info.files[index];
+    if (!file) return;
+    const bytes = active.rom.subarray(file.start, file.start + file.size);
+    downloadBlob(new Blob([new Uint8Array(bytes)]), file.name.split("/").pop() || "extracted");
+  }
+
+  function downloadAllNdsFiles() {
+    if (active?.kind !== "nds") return;
+    active.info.files.forEach((file, i) => {
+      if (file.size > 8 * 1024 * 1024) return;
+      window.setTimeout(() => downloadNdsFile(i), i * 400);
+    });
+  }
+
+  function copyScript() {
+    if (!script) return;
+    const done = () => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    };
+    const fallback = () => {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = script;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        done();
+      } catch {
+        setScriptError("Copy failed — select the text manually.");
+      }
+    };
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(script).then(done).catch(fallback);
+    } else {
+      fallback();
     }
   }
 
@@ -313,11 +549,11 @@ export function KgbApp() {
         <p className="text-sm font-extrabold text-line-deep">GBA and DS files</p>
         <h1 className="text-4xl font-extrabold leading-none text-ink">KGB</h1>
         <p className="mt-2 max-w-lg text-base font-semibold leading-snug text-ink">
-          Get the GBA game out of a 3DS file. Pack it into a DS file. Change the DS menu icon.
+          Get the GBA or GB/GBC game out of a 3DS file. Pack it into a DS file. Change the DS menu icon.
         </p>
       </header>
 
-      <main className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-5 sm:px-6">
+      <main className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-5 sm:px-6" aria-busy={busy !== null}>
         <section
           className={"window px-4 py-5 sm:px-5 " + (dragOver ? "ring-4 ring-gold" : "")}
           onDragOver={(event) => {
@@ -328,43 +564,98 @@ export function KgbApp() {
           onDrop={(event) => {
             event.preventDefault();
             setDragOver(false);
-            onFile(event.dataTransfer.files[0]);
+            void onFiles(event.dataTransfer.files);
+          }}
+          tabIndex={0}
+          role="button"
+          aria-label="Drop files here, or press Enter to choose files"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              inputRef.current?.click();
+            }
+          }}
+          onClick={(event) => {
+            if (event.target === event.currentTarget) inputRef.current?.click();
           }}
         >
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h2 className="text-lg font-extrabold">Drop a .cia, .gba, or .nds</h2>
-              <p className="mt-1 text-sm font-semibold text-muted">Stays in this browser. Nothing is uploaded.</p>
+              <h2 className="text-lg font-extrabold">Drop .cia, .gba, .gb, or .nds</h2>
+              <p className="mt-1 text-sm font-semibold text-muted">
+                Stays in this browser. Nothing is uploaded.
+                {busy ? ` ${busy}` : " Multiple files queue up (max 20)."}
+              </p>
             </div>
-            <button type="button" className="btn btn-primary" onClick={() => inputRef.current?.click()}>
-              Choose file
-            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={busy !== null}
+                onClick={() => inputRef.current?.click()}
+              >
+                Choose files
+              </button>
+              {busy && (
+                <button type="button" className="btn btn-ghost" onClick={cancelBusy}>
+                  Cancel
+                </button>
+              )}
+            </div>
             <input
               ref={inputRef}
               type="file"
-              accept=".cia,.cxi,.app,.gba,.agb,.nds,.srl,application/octet-stream"
+              accept=".cia,.cxi,.app,.gba,.agb,.gb,.gbc,.nds,.srl,application/octet-stream"
+              multiple
               className="sr-only"
               suppressHydrationWarning
-              onChange={(event) => onFile(event.target.files?.[0])}
+              onChange={(event) => {
+                void onFiles(event.target.files);
+                event.target.value = "";
+              }}
             />
           </div>
         </section>
+
+        <QueueBar
+          entries={entries.map((e) => ({ id: e.id, name: e.name, kind: e.kind }))}
+          activeId={activeId}
+          onSelect={setActiveId}
+          onRemove={(id) => {
+            setEntries((prev) => prev.filter((e) => e.id !== id));
+            if (id === activeId) setActiveId(null);
+          }}
+          onClear={() => {
+            cancelKgbWork();
+            busyRef.current = false;
+            setBusy(null);
+            setEntries([]);
+            setActiveId(null);
+            setError(null);
+          }}
+        />
 
         <div className="flex items-center gap-2">
           <TabButton active={tab === "dossier"} onClick={() => setTab("dossier")}>
             File
           </TabButton>
+          <TabButton active={tab === "player"} onClick={() => setTab("player")}>
+            <Gamepad2 className="size-4" />
+            Play & Test
+          </TabButton>
           <TabButton active={tab === "cli"} onClick={() => setTab("cli")}>
             <Terminal className="size-4" />
             Script
           </TabButton>
-          {loaded && (
+          {active && (
             <button
               type="button"
               className="ml-auto min-h-11 px-2 text-sm font-extrabold text-line-deep underline-offset-2 hover:underline"
               onClick={() => {
-                setLoaded(null);
+                setEntries((prev) => prev.filter((e) => e.id !== active.id));
+                setActiveId(null);
                 setError(null);
+                setErrorPartial(null);
                 setTab("dossier");
               }}
             >
@@ -373,23 +664,36 @@ export function KgbApp() {
           )}
         </div>
 
-        {tab === "cli" ? (
+        {tab === "player" ? (
+          playable ? (
+            <EmulatorPlayer
+              rom={playable.rom}
+              title={playable.title}
+              system={playable.system}
+              onClose={() => setTab("dossier")}
+            />
+          ) : (
+            <section className="window flex flex-col items-center justify-center p-8 text-center">
+              <Gamepad2 className="size-12 text-muted" />
+              <h3 className="mt-3 font-extrabold text-line">No ROM selected</h3>
+              <p className="mt-1 max-w-md text-sm font-semibold text-muted">
+                Drop or open a 3DS Virtual Console CIA (.cia), Game Boy ROM (.gb), Game Boy Color (.gbc), or Game Boy Advance (.gba) to play and test it here.
+              </p>
+            </section>
+          )
+        ) : tab === "cli" ? (
           <CliPanel
             script={script}
+            scriptError={scriptError}
+            onRetry={loadScript}
             copied={copied}
-            onCopy={() => {
-              navigator.clipboard.writeText(script).then(() => {
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1500);
-              });
-            }}
+            onCopy={copyScript}
           />
         ) : (
           <>
             {error && (
-              <section className="window p-4" role="alert">
+              <section className="window p-4" role="alert" aria-live="assertive">
                 <div className="flex items-start gap-3">
-                  <TriangleAlert className="mt-0.5 size-5 shrink-0 text-red" aria-hidden="true" />
                   <div>
                     <h2 className="font-extrabold text-red">Couldn’t read that file</h2>
                     <p className="mt-1 text-sm font-semibold leading-relaxed">{error}</p>
@@ -400,12 +704,19 @@ export function KgbApp() {
                         ))}
                       </ul>
                     )}
+                    {errorPartial?.titleId && (
+                      <p className="mt-2 text-xs font-semibold text-muted">
+                        What we could read: title {errorPartial.titleId} · product{" "}
+                        {errorPartial.productCode || "—"} · files{" "}
+                        {(errorPartial.exefsNames ?? []).filter(Boolean).join(" ") || "—"}.
+                      </p>
+                    )}
                   </div>
                 </div>
               </section>
             )}
 
-            {!loaded && !error && (
+            {!active && !error && (
               <section className="grid gap-3 sm:grid-cols-3">
                 {[
                   ["CIA to GBA", "Open a 3DS Virtual Console .cia and download the GBA ROM."],
@@ -428,23 +739,32 @@ export function KgbApp() {
                 trimmedCount={trimmedCount}
                 outSize={ciaRom.length}
                 sha={sha}
-                onRom={saveRom}
+                onRom={() => void saveRomExt(dossier.system === "gb" ? "gb" : dossier.system === "gbc" ? "gbc" : "gba")}
+                onDownloadGb={() => void saveRomExt("gb")}
+                onDownloadGbc={() => void saveRomExt("gbc")}
+                onDownloadGba={() => void saveRomExt("gba")}
+                onPlay={() => setTab("player")}
                 onJson={saveJson}
                 onFooter={saveFooter}
                 onIcon={saveIcon}
               />
             )}
 
-            {loaded?.kind === "gba" && <GbaView fileName={loaded.fileName} rom={loaded.rom} sha={sha} />}
+            {active?.kind === "gba" && (
+              <GbaView fileName={active.name} rom={active.rom} sha={sha} onPlay={() => setTab("player")} />
+            )}
 
-            {loaded?.kind === "nds" && (
+            {active?.kind === "nds" && (
               <NdsView
-                info={loaded.info}
+                info={active.info}
                 sha={sha}
+                busy={busy !== null}
                 onGba={saveEmbeddedGba}
                 onIcon={saveBannerIcon}
+                onDownloadFile={downloadNdsFile}
+                onDownloadAll={downloadAllNdsFiles}
                 pickedName={pickedIcon?.name ?? null}
-                pickedPreview={pickedIcon ? previewHeaderIcon(loaded.info.gameCode, pickedIcon.image) : null}
+                pickedPreview={pickedIcon ? previewHeaderIcon(active.info.gameCode, pickedIcon.image) : null}
                 iconNote={iconNote}
                 onPick={onPickIcon}
                 onClearPick={() => setPickedIcon(null)}
@@ -457,14 +777,15 @@ export function KgbApp() {
                 label={carryLabel}
                 top={screens.top}
                 bottom={screens.bottom}
-                onPack={saveNds}
+                busy={busy !== null}
+                onPack={() => void saveNds()}
                 headerIcon={headerIcon}
                 setHeaderIcon={setHeaderIcon}
                 usingPicture={bannerSource !== null}
                 preview={headerPreview}
                 pickedName={pickedIcon?.name ?? null}
-                iconNote={loaded?.kind === "nds" ? null : iconNote}
-                showFile={loaded?.kind !== "nds"}
+                iconNote={active?.kind === "nds" ? null : iconNote}
+                showFile={active?.kind !== "nds"}
                 onPick={onPickIcon}
                 onClearPick={() => {
                   setPickedIcon(null);
@@ -476,508 +797,5 @@ export function KgbApp() {
         )}
       </main>
     </div>
-  );
-}
-
-function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
-  return (
-    <button type="button" onClick={onClick} className={"btn " + (active ? "menu-on" : "menu-off")}>
-      {children}
-    </button>
-  );
-}
-
-function CiaView({
-  dossier,
-  trim,
-  setTrim,
-  trimmedCount,
-  outSize,
-  sha,
-  onRom,
-  onJson,
-  onFooter,
-  onIcon,
-}: {
-  dossier: Dossier;
-  trim: boolean;
-  setTrim: (value: boolean) => void;
-  trimmedCount: number;
-  outSize: number;
-  sha: string;
-  onRom: () => void;
-  onJson: () => void;
-  onFooter: () => void;
-  onIcon: () => void;
-}) {
-  const log = dossierLog(dossier);
-  const offsets: [string, string][] = [
-    ["CIA header", hex(dossier.offsets.ciaHeader)],
-    ["NCCH", hex(dossier.offsets.ncch)],
-    ["ExeFS", hex(dossier.offsets.exefs)],
-    ["ROM start", hex(dossier.offsets.romStartInCode)],
-    [".CAA footer", hex(dossier.offsets.footerInCode)],
-    ["Icon", dossier.offsets.iconInFile >= 0 ? hex(dossier.offsets.iconInFile) : "—"],
-  ];
-
-  return (
-    <div className="flex flex-col gap-4">
-      {dossier.encrypted && (
-        <p className="window px-4 py-3 text-sm font-bold text-red">This CIA looks encrypted. The ROM may not be playable.</p>
-      )}
-
-      <section className="window p-4">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
-          <IconPlate rgba={dossier.iconRgba} size={48} empty="No icon" />
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-xs font-bold text-muted">{dossier.fileName}</p>
-            <h2 className="mt-1 text-2xl font-extrabold leading-tight">{dossier.smdh?.short || dossier.gba.title || "Untitled"}</h2>
-            <p className="font-extrabold text-line">{dossier.gba.gameCode || "----"}</p>
-            <p className="mt-2 text-sm font-semibold text-muted">{dossier.smdh?.publisher || "Publisher unknown"}</p>
-          </div>
-        </div>
-        <div className="mt-4 grid gap-2 sm:grid-cols-3">
-          <Stat label="ROM" value={formatBytes(outSize)} detail={dossier.gba.checksumOk ? "Header OK" : "Header checksum bad"} />
-          <Stat label="Save" value={dossier.caa.save.name} detail={dossier.caa.save.rtc ? "Has a clock" : "No clock"} />
-          <Stat label="Screen fix" value={ghostingLabel(dossier.caa.lcdGhosting)} detail={dossier.caa.magicOk ? "Footer found" : "Footer missing"} />
-        </div>
-      </section>
-
-      <section className="window p-4">
-        <label className="flex min-h-11 items-start gap-3 text-sm font-bold">
-          <input
-            type="checkbox"
-            checked={trim}
-            onChange={(event) => setTrim(event.target.checked)}
-            className="mt-1 size-5 accent-red"
-          />
-          <span>
-            Cut empty padding off the end
-            <span className="mt-0.5 block font-semibold text-muted">
-              {trimmedCount > 0
-                ? `${formatBytes(trimmedCount)} of 0xFF. The download becomes ${formatBytes(outSize)}.`
-                : "This ROM has no padding to cut."}
-            </span>
-          </span>
-        </label>
-        <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <Action icon={<Download className="size-4" />} onClick={onRom} primary>
-            Download .gba
-          </Action>
-          <Action icon={<Download className="size-4" />} onClick={onIcon} disabled={!dossier.iconRgba}>
-            Download icon
-          </Action>
-        </div>
-        <p className="mt-3 break-all text-xs font-semibold text-muted">SHA-256 {sha || "…"}</p>
-      </section>
-
-      <details className="window px-4 py-3">
-        <summary className="font-extrabold">Save config and offsets</summary>
-        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-          {offsets.map(([label, value]) => (
-            <div key={label} className="rounded-lg bg-line-lite px-3 py-2">
-              <p className="text-xs font-bold text-muted">{label}</p>
-              <p className="text-sm font-extrabold text-line-deep">{value}</p>
-            </div>
-          ))}
-        </div>
-        <LutStrip lut={dossier.caa.videoLut} />
-        <p className="mt-3 text-xs font-semibold leading-relaxed text-muted">
-          {dossier.caa.save.alias}. Sleep combo {hex(dossier.caa.sleepCombo, 4)}.
-        </p>
-        <pre className="mt-3 max-h-64 overflow-auto rounded-lg bg-line-lite p-3 text-xs leading-relaxed">{log.join("\n")}</pre>
-        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <Action icon={<FileCode2 className="size-4" />} onClick={onJson}>
-            Download save config
-          </Action>
-          <Action icon={<Download className="size-4" />} onClick={onFooter}>
-            Download footer
-          </Action>
-        </div>
-      </details>
-    </div>
-  );
-}
-
-function GbaView({ fileName, rom, sha }: { fileName: string; rom: Uint8Array; sha: string }) {
-  const header = readGbaHeader(rom);
-  return (
-    <section className="window p-4">
-      <p className="truncate text-xs font-bold text-muted">{fileName}</p>
-      <h2 className="mt-1 text-2xl font-extrabold">{header.title || "Untitled"}</h2>
-      <p className="font-extrabold text-line">{header.gameCode || "----"}</p>
-      <div className="mt-4 grid gap-2 sm:grid-cols-3">
-        <Stat label="Size" value={formatBytes(rom.length)} detail={hex(rom.length)} />
-        <Stat label="Header" value={header.checksumOk ? "OK" : "Bad checksum"} detail={`Maker ${header.maker || "--"}`} />
-        <Stat label="Logo" value={header.logoOk ? "Present" : "Missing"} detail={header.logoOk ? "Looks like a GBA ROM" : "Still packable"} />
-      </div>
-      <p className="mt-3 break-all text-xs font-semibold text-muted">SHA-256 {sha || "…"}</p>
-    </section>
-  );
-}
-
-function NdsView({
-  info,
-  sha,
-  onGba,
-  onIcon,
-  pickedName,
-  pickedPreview,
-  iconNote,
-  onPick,
-  onClearPick,
-  onPatch,
-}: {
-  info: NdsInfo;
-  sha: string;
-  onGba: () => void;
-  onIcon: () => void;
-  pickedName: string | null;
-  pickedPreview: Uint8ClampedArray | null;
-  iconNote: string | null;
-  onPick: (file: File) => void;
-  onClearPick: () => void;
-  onPatch: () => void;
-}) {
-  const shown = info.files.slice(0, 8);
-  return (
-    <div className="flex flex-col gap-4">
-      <section className="window p-4">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
-          <IconPlate rgba={info.iconRgba} size={32} empty="No icon" />
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-xs font-bold text-muted">{info.fileName}</p>
-            <h2 className="mt-1 text-2xl font-extrabold leading-tight">{info.bannerTitle || info.title || "Untitled"}</h2>
-            <p className="font-extrabold text-line">{info.gameCode || "----"}</p>
-            <p className="mt-1 text-sm font-semibold text-muted">
-              {info.unitCode === 2 ? "DSi" : "DS"} · {formatBytes(info.fileSize)} · {info.headerCrcOk ? "header OK" : "header checksum bad"}
-            </p>
-          </div>
-        </div>
-        {info.warnings.length > 0 && (
-          <ul className="mt-3 list-disc pl-4 text-sm font-semibold text-muted">
-            {info.warnings.map((note) => (
-              <li key={note}>{note}</li>
-            ))}
-          </ul>
-        )}
-        <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <Action icon={<Download className="size-4" />} onClick={onGba} primary disabled={!info.gba}>
-            {info.gba ? "Download .gba" : "No GBA ROM inside"}
-          </Action>
-          <Action icon={<Download className="size-4" />} onClick={onIcon} disabled={!info.iconRgba}>
-            Download icon
-          </Action>
-        </div>
-        {info.gba && <p className="mt-3 break-all text-xs font-semibold text-muted">GBA SHA-256 {sha || "…"}</p>}
-      </section>
-
-      {shown.length > 0 && (
-        <section className="window p-4">
-          <h2 className="font-extrabold">Files inside</h2>
-          <ul className="mt-2 divide-y divide-line-lite text-sm font-semibold">
-            {shown.map((file) => (
-              <li key={`${file.name}:${file.start}`} className="flex items-baseline justify-between gap-3 py-2">
-                <span className="break-all">{file.name}</span>
-                <span className="shrink-0 text-xs text-muted">{formatBytes(file.size)}</span>
-              </li>
-            ))}
-          </ul>
-          {info.files.length > shown.length && (
-            <p className="mt-2 text-xs font-semibold text-muted">{info.files.length - shown.length} more files.</p>
-          )}
-        </section>
-      )}
-
-      <section className="window p-4">
-        <h2 className="font-extrabold">Menu icon</h2>
-        <p className="mt-1 text-sm font-semibold text-muted">Pick a picture. It becomes the 32×32 icon on the DS menu.</p>
-        <HeaderIconFields
-          preview={pickedPreview ?? info.iconRgba}
-          previewSize={32}
-          empty="No icon"
-          pickedName={pickedName}
-          iconNote={iconNote}
-          showFile
-          onPick={onPick}
-          onClearPick={onClearPick}
-        />
-        <div className="mt-4">
-          <Action icon={<Download className="size-4" />} onClick={onPatch} primary disabled={!pickedName}>
-            Save DS file with this icon
-          </Action>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function CarrierPanel({
-  label,
-  top,
-  bottom,
-  onPack,
-  headerIcon,
-  setHeaderIcon,
-  usingPicture,
-  preview,
-  pickedName,
-  iconNote,
-  showFile,
-  onPick,
-  onClearPick,
-}: {
-  label: CarrierLabel;
-  top: Uint8Array;
-  bottom: Uint8Array;
-  onPack: () => void;
-  headerIcon: boolean;
-  setHeaderIcon: (value: boolean) => void;
-  usingPicture: boolean;
-  preview: Uint8ClampedArray;
-  pickedName: string | null;
-  iconNote: string | null;
-  showFile: boolean;
-  onPick: (file: File) => void;
-  onClearPick: () => void;
-}) {
-  return (
-    <section className="window p-4">
-      <div className="grid gap-4 lg:grid-cols-[13rem_1fr] lg:items-start">
-        <div>
-          <p className="font-extrabold text-line">Title card</p>
-          <div className="mt-2 rounded-2xl bg-shell p-2">
-            <Rgb555Canvas pixels={top} label="DS top screen" />
-            <div className="my-1 h-2 rounded-full bg-ink/40" />
-            <Rgb555Canvas pixels={bottom} label="DS bottom screen" />
-          </div>
-        </div>
-        <div>
-          <h2 className="text-lg font-extrabold">Make a DS file</h2>
-          <p className="mt-1 text-sm font-semibold leading-relaxed text-muted">
-            {label.title || "This ROM"} is stored inside as rom.gba. The DS shows the card on the left. It does not play the GBA game.
-          </p>
-          <p className="mt-2 text-xs font-bold text-muted">
-            {label.gameCode || "----"} · {formatBytes(label.bytes)} · {label.checksumOk ? "header OK" : "header checksum bad"}
-          </p>
-          <label className="mt-4 flex min-h-11 items-start gap-3 text-sm font-bold">
-            <input
-              type="checkbox"
-              checked={headerIcon}
-              onChange={(event) => setHeaderIcon(event.target.checked)}
-              className="mt-1 size-5 accent-red"
-            />
-            <span>
-              Use a picture as the menu icon
-              <span className="mt-0.5 block font-semibold text-muted">
-                {headerIcon && usingPicture
-                  ? "The DS menu will show this picture, in 16 colors."
-                  : "Off uses a simple icon with the game code."}
-              </span>
-            </span>
-          </label>
-          <HeaderIconFields
-            preview={preview}
-            previewSize={32}
-            empty="Icon"
-            pickedName={showFile ? pickedName : null}
-            iconNote={iconNote}
-            showFile={showFile}
-            onPick={onPick}
-            onClearPick={onClearPick}
-          />
-          <div className="mt-4">
-            <Action icon={<Download className="size-4" />} onClick={onPack} primary>
-              Download .nds
-            </Action>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function HeaderIconFields({
-  preview,
-  previewSize,
-  empty,
-  pickedName,
-  iconNote,
-  showFile,
-  onPick,
-  onClearPick,
-}: {
-  preview: Uint8ClampedArray | null;
-  previewSize: number;
-  empty: string;
-  pickedName: string | null;
-  iconNote: string | null;
-  showFile: boolean;
-  onPick: (file: File) => void;
-  onClearPick: () => void;
-}) {
-  return (
-    <div className="mt-4 flex flex-wrap items-center gap-4">
-      <IconPlate rgba={preview} size={previewSize} empty={empty} />
-      {showFile && (
-        <div className="flex min-w-0 flex-1 flex-col items-start gap-2">
-          <label className="btn btn-ghost cursor-pointer">
-            Choose picture
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/gif,image/webp"
-              className="sr-only"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.target.value = "";
-                if (file) onPick(file);
-              }}
-            />
-          </label>
-          {pickedName ? (
-            <button type="button" onClick={onClearPick} className="min-h-11 text-sm font-extrabold text-line-deep underline-offset-2 hover:underline">
-              Remove {pickedName}
-            </button>
-          ) : (
-            <p className="text-xs font-semibold text-muted">PNG, JPEG, GIF, or WebP.</p>
-          )}
-          {iconNote && <p className="text-sm font-bold text-red">{iconNote}</p>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Rgb555Canvas({ pixels, label }: { pixels: Uint8Array; label: string }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const image = ctx.createImageData(256, 192);
-    for (let i = 0; i < 256 * 192; i++) {
-      const color = pixels[i * 2]! | (pixels[i * 2 + 1]! << 8);
-      const [r, g, b] = expand555(color);
-      const o = i * 4;
-      image.data[o] = r;
-      image.data[o + 1] = g;
-      image.data[o + 2] = b;
-      image.data[o + 3] = 255;
-    }
-    ctx.putImageData(image, 0, 0);
-  }, [pixels]);
-  return <canvas ref={ref} width={256} height={192} className="pixelated h-auto w-full rounded-md bg-ink" aria-label={label} />;
-}
-
-function Stat({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="rounded-lg bg-line-lite px-3 py-3">
-      <p className="text-xs font-bold text-muted">{label}</p>
-      <p className="mt-1 text-sm font-extrabold leading-snug">{value}</p>
-      <p className="mt-1 text-xs font-semibold text-line-deep">{detail}</p>
-    </div>
-  );
-}
-
-function Action({
-  children,
-  onClick,
-  icon,
-  primary,
-  disabled,
-}: {
-  children: ReactNode;
-  onClick: () => void;
-  icon: ReactNode;
-  primary?: boolean;
-  disabled?: boolean;
-}) {
-  return (
-    <button type="button" disabled={disabled} onClick={onClick} className={"btn w-full " + (primary ? "btn-primary" : "btn-ghost")}>
-      {icon}
-      {children}
-    </button>
-  );
-}
-
-function IconPlate({ rgba, size, empty }: { rgba: Uint8ClampedArray | null; size: number; empty: string }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas || !rgba) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.imageSmoothingEnabled = false;
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), size, size), 0, 0);
-  }, [rgba, size]);
-  if (!rgba) {
-    return (
-      <div className="flex h-28 w-28 items-center justify-center rounded-xl border-4 border-line bg-line-lite text-xs font-extrabold text-muted">
-        {empty}
-      </div>
-    );
-  }
-  return (
-    <canvas
-      ref={ref}
-      width={size}
-      height={size}
-      className="pixelated h-28 w-28 rounded-xl border-4 border-line bg-field"
-      aria-label={`${size} by ${size} icon`}
-    />
-  );
-}
-
-function LutStrip({ lut }: { lut: Uint8Array }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const image = ctx.createImageData(256, 1);
-    for (let i = 0; i < 256; i++) {
-      image.data[i * 4] = lut[i * 3] ?? 0;
-      image.data[i * 4 + 1] = lut[i * 3 + 1] ?? 0;
-      image.data[i * 4 + 2] = lut[i * 3 + 2] ?? 0;
-      image.data[i * 4 + 3] = 255;
-    }
-    ctx.putImageData(image, 0, 0);
-  }, [lut]);
-  return (
-    <canvas
-      ref={ref}
-      width={256}
-      height={1}
-      className="pixelated mt-3 h-6 w-full rounded-md border-2 border-line"
-      aria-label="Screen color table"
-    />
-  );
-}
-
-function CliPanel({ script, copied, onCopy }: { script: string; copied: boolean; onCopy: () => void }) {
-  return (
-    <section className="window overflow-hidden">
-      <header className="flex flex-wrap items-center justify-between gap-2 border-b-4 border-line-lite px-4 py-3">
-        <div>
-          <h2 className="font-extrabold">kgb.py</h2>
-          <p className="text-xs font-semibold text-muted">Same CIA to GBA step, for a terminal. DS packing stays in the browser.</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={onCopy} className="btn btn-ghost">
-            {copied ? "Copied" : "Copy"}
-          </button>
-          <a href="/kgb.py" download="kgb.py" className="btn btn-primary">
-            Download
-          </a>
-        </div>
-      </header>
-      <div className="border-b-4 border-line-lite px-4 py-3 font-mono text-xs font-semibold leading-relaxed text-line-deep">
-        <p>python3 kgb.py game.cia -o ./out</p>
-        <p>python3 kgb.py game.cia --trim-ff</p>
-      </div>
-      <pre className="max-h-[28rem] overflow-auto px-4 py-3 text-xs leading-relaxed">{script || "Loading…"}</pre>
-    </section>
   );
 }

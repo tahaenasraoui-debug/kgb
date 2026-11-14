@@ -1,3 +1,7 @@
+import type { GbHeader } from "./gb.ts";
+
+export type SystemKind = "gba" | "gb" | "gbc";
+
 export type SaveInfo = {
   id: number;
   name: string;
@@ -54,9 +58,26 @@ export type CaaFooter = {
   footer: Uint8Array;
 };
 
+export function makeEmptyCaa(): CaaFooter {
+  return {
+    romSize: 0,
+    save: { id: 0, name: "None", rtc: false, bytes: 0, alias: "None" },
+    lcdGhosting: 0,
+    sleepCombo: 0,
+    flashConfigHex: "",
+    videoLut: new Uint8Array(0),
+    version: 0,
+    descriptorOffset: 0,
+    descriptorCountShifted: 0,
+    magicOk: false,
+    footer: new Uint8Array(0),
+  };
+}
+
 export type Dossier = {
   fileName: string;
   fileSize: number;
+  system: SystemKind;
   titleId: string;
   productCode: string;
   encrypted: boolean;
@@ -66,6 +87,7 @@ export type Dossier = {
   offsets: Offsets;
   preambleBytes: number;
   gba: GbaHeader;
+  gb?: GbHeader;
   caa: CaaFooter;
   rom: Uint8Array;
   romSizeFieldTrusted: boolean;
@@ -85,3 +107,13 @@ export class KgbError extends Error {
     this.partial = partial;
   }
 }
+
+export type CarrierLabel = {
+  title: string;
+  gameCode: string;
+  maker: string;
+  version: number;
+  bytes: number;
+  checksumOk: boolean;
+  iconRgba?: Uint8ClampedArray | null;
+};

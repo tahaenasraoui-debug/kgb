@@ -6,9 +6,9 @@ export const GBA_LOGO_16 = Uint8Array.of(
   0x24, 0xff, 0xae, 0x51, 0x69, 0x9a, 0xa2, 0x21, 0x3d, 0x84, 0x82, 0x0a, 0x84, 0xe4, 0x09, 0xad,
 );
 
-export function gbaHeaderChecksum(header: Uint8Array): number {
+export function gbaHeaderChecksum(header: Uint8Array, off = 0): number {
   let chk = 0;
-  for (let i = 0xa0; i <= 0xbc; i++) chk = (chk - (header[i] ?? 0)) & 0xff;
+  for (let i = 0xa0; i <= 0xbc; i++) chk = (chk - (header[off + i] ?? 0)) & 0xff;
   return (chk - 0x19) & 0xff;
 }
 
@@ -18,7 +18,7 @@ function logoAt(code: Uint8Array, off: number): boolean {
     if (code[off + 0x04 + i] !== GBA_LOGO_16[i]) return false;
   }
   if (code[off + 0xb2] !== 0x96) return false;
-  const expect = gbaHeaderChecksum(code.subarray(off, off + 0xc0));
+  const expect = gbaHeaderChecksum(code, off);
   return code[off + 0xbd] === expect;
 }
 
@@ -76,17 +76,17 @@ export function findCaaFooter(code: Uint8Array): FooterHit | null {
   return null;
 }
 
-export function readGbaHeader(rom: Uint8Array): GbaHeader {
+export function readGbaHeader(rom: Uint8Array, off = 0): GbaHeader {
   const logoOk =
-    rom.length >= 0x14 && GBA_LOGO_16.every((b, i) => rom[0x04 + i] === b);
-  const checksum = rom.length >= 0xbe ? gbaHeaderChecksum(rom) : 0;
+    rom.length >= off + 0x14 && GBA_LOGO_16.every((b, i) => rom[off + 0x04 + i] === b);
+  const checksum = rom.length >= off + 0xbe ? gbaHeaderChecksum(rom, off) : 0;
   return {
-    title: rom.length >= 0xac ? asciiField(rom, 0xa0, 12) : "",
-    gameCode: rom.length >= 0xb0 ? asciiField(rom, 0xac, 4) : "",
-    maker: rom.length >= 0xb2 ? asciiField(rom, 0xb0, 2) : "",
-    version: rom.length > 0xbc ? rom[0xbc]! : 0,
+    title: rom.length >= off + 0xac ? asciiField(rom, off + 0xa0, 12) : "",
+    gameCode: rom.length >= off + 0xb0 ? asciiField(rom, off + 0xac, 4) : "",
+    maker: rom.length >= off + 0xb2 ? asciiField(rom, off + 0xb0, 2) : "",
+    version: rom.length > off + 0xbc ? rom[off + 0xbc]! : 0,
     checksum,
-    checksumOk: rom.length > 0xbd && rom[0xbd] === checksum && rom[0xb2] === 0x96,
+    checksumOk: rom.length > off + 0xbd && rom[off + 0xbd] === checksum && rom[off + 0xb2] === 0x96,
     logoOk,
   };
 }

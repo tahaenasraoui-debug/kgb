@@ -2,7 +2,9 @@ import { blzDecompress } from "./blz.ts";
 import { findCaaFooter, findRomStart, readCaa, readGbaHeader } from "./gba.ts";
 import { asciiField } from "./format.ts";
 import { parseSmdh } from "./smdh.ts";
-import { KgbError, type Dossier, type Offsets } from "./types.ts";
+import { readGbHeader, type GbHeader } from "./gb.ts";
+import { extractGbRomFromRomfs } from "./romfs.ts";
+import { makeEmptyCaa, KgbError, type Dossier, type GbaHeader, type Offsets, type SystemKind } from "./types.ts";
 
 function align64(x: number): number {
   return (x + 0x3f) & ~0x3f;
@@ -22,7 +24,7 @@ function nameAt(data: Uint8Array, off: number): string {
   return s;
 }
 
-export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
+export function parseCia(buffer: ArrayBuffer | ArrayBufferLike, fileName = "title.cia"): Dossier {
   const warnings: string[] = [];
   const data = new Uint8Array(buffer);
   const view = new DataView(buffer);
@@ -64,7 +66,7 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
   const magic = asciiField(data, ncch + 0x100, 4);
   if (magic !== "NCCH") {
     throw new KgbError(
-      `Expected NCCH magic at ${ncch + 0x100}, found "${magic || "—"}". This is not an unwrapped GBA VC CIA.`,
+      `Expected NCCH magic at ${ncch + 0x100}, found "${magic || "—"}". This is not an unwrapped 3DS CIA.`,
       warnings,
     );
   }
@@ -82,7 +84,9 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
   const exefsMedia = u32(view, ncch + 0x1a0);
   const exefs = ncch + exefsMedia * 0x200;
   const exefsBytes = exefs;
+  const romfsMedia = ncch + 0x1b0 + 4 <= data.length ? u32(view, ncch + 0x1b0) : 0;
   let codeCompressed = false;
+  // ExHeader system-control-info flag byte: bit0 = compress .code with BLZ (3DBrew ExHeader).
   if (ncch + 0x200 + 0x0d < exefsBytes && ncch + 0x20d < data.length) {
     codeCompressed = (data[ncch + 0x200 + 0x0d]! & 0x01) !== 0;
   }
@@ -113,6 +117,20 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
     }
   }
 
+  // Parse SMDH icon and metadata
+  let smdh: Dossier["smdh"] = null;
+  let iconRgba: Uint8ClampedArray | null = null;
+  if (iconOff >= 0 && iconSize > 0 && iconOff + iconSize <= data.length) {
+    const parsed = parseSmdh(data.subarray(iconOff, iconOff + iconSize));
+    if (!parsed) warnings.push('ExeFS "icon" is not an SMDH (magic mismatch).');
+    else {
+      smdh = parsed.titles;
+      iconRgba = parsed.icon;
+    }
+  } else {
+    warnings.push("No SMDH icon in ExeFS.");
+  }
+
   if (codeOff < 0 || codeSize <= 0) {
     throw new KgbError(`ExeFS has no .code file. Names: ${exefsNames.filter(Boolean).join(", ") || "none"}.`, warnings);
   }
@@ -120,7 +138,7 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
     throw new KgbError(".code extends past the end of the file.", warnings);
   }
 
-  let code: Uint8Array = new Uint8Array(data.subarray(codeOff, codeOff + codeSize));
+  let code: Uint8Array = data.subarray(codeOff, codeOff + codeSize);
   let decompressed = false;
   if (codeCompressed) {
     try {
@@ -133,18 +151,83 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
     }
   }
 
+  const partialBase = { fileName, fileSize: data.length, titleId, productCode, encrypted, exefsNames };
+
   const romStart = findRomStart(code);
+
+  // If no GBA header is found in .code, check if this is a Game Boy (GB/GBC) Virtual Console RomFS title!
   if (romStart === null) {
-    throw new KgbError(
-      encrypted
-        ? "No GBA cartridge header in .code. The CIA looks encrypted — KGB only reads NoCrypto injects (vcoven / NSUI)."
-        : "No GBA cartridge header in .code. The logo, fixed 0x96 byte, and header checksum never matched.",
-      warnings,
-    );
+    if (romfsMedia > 0) {
+      const gbResult = extractGbRomFromRomfs(data, ncch, romfsMedia);
+      if (gbResult) {
+        const gb = gbResult.header;
+        const system: SystemKind = gb.cgbOnly ? "gbc" : "gb";
+        warnings.push(
+          `Extracted Game Boy (${system.toUpperCase()}) ROM "${gb.title}" from 3DS Virtual Console RomFS (${gbResult.source}).`,
+        );
+
+        const gba: GbaHeader = {
+          title: gb.title,
+          gameCode: gb.manufacturerCode || gb.title.replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(4, "-"),
+          maker: gb.newLicensee || "01",
+          version: gb.version,
+          checksum: gb.headerChecksum,
+          checksumOk: gb.checksumOk,
+          logoOk: gb.logoOk,
+        };
+
+        const offsets: Offsets = {
+          ciaHeader: headerSize,
+          certSize,
+          ticketSize,
+          tmdSize,
+          metaSize,
+          contentSize,
+          ncch,
+          exefs,
+          codeInFile: codeOff,
+          iconInFile: iconOff,
+          preambleInCode: 0,
+          romStartInCode: 0,
+          footerInCode: 0,
+          romInFile: ncch + romfsMedia * 0x200,
+        };
+
+        return {
+          fileName,
+          fileSize: data.length,
+          system,
+          titleId,
+          productCode,
+          encrypted,
+          codeCompressed,
+          decompressed,
+          exefsNames,
+          offsets,
+          preambleBytes: 0,
+          gba,
+          gb,
+          caa: makeEmptyCaa(),
+          rom: gbResult.rom,
+          romSizeFieldTrusted: true,
+          smdh,
+          iconRgba,
+          warnings,
+        };
+      }
+    }
+
+    let detail = "No GBA or GB/GBC cartridge header found in .code or RomFS.";
+    if (encrypted) {
+      detail = "No cartridge header found. The CIA looks encrypted — KGB only reads NoCrypto injects. Rebuild the CIA as NoCrypto with vcoven or NSUI (decrypt with GodMode9 first if it is a personal dump), then try again.";
+    } else if (romfsMedia > 0) {
+      detail = "This CIA contains a RomFS partition, but no valid GBA, Game Boy (GB), or Game Boy Color (GBC) ROM was recognized inside.";
+    }
+    throw new KgbError(detail, warnings, partialBase);
   }
 
   const footerHit = findCaaFooter(code);
-  if (!footerHit) throw new KgbError(".code is too small to contain a 0x360 AGB_FIRM footer.", warnings);
+  if (!footerHit) throw new KgbError(".code is too small to contain a 0x360 AGB_FIRM footer.", warnings, partialBase);
   if (!footerHit.trustedMagic) {
     warnings.push("'.CAA' magic was not found. Using the last 0x360 bytes as a fallback footer.");
   }
@@ -178,21 +261,8 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
     warnings.push(`Stripped a ${romStart}-byte preamble before the cartridge header.`);
   }
 
-  let smdh: Dossier["smdh"] = null;
-  let iconRgba: Uint8ClampedArray | null = null;
-  if (iconOff >= 0 && iconSize > 0 && iconOff + iconSize <= data.length) {
-    const parsed = parseSmdh(data.slice(iconOff, iconOff + iconSize));
-    if (!parsed) warnings.push('ExeFS "icon" is not an SMDH (magic mismatch).');
-    else {
-      smdh = parsed.titles;
-      iconRgba = parsed.icon;
-    }
-  } else {
-    warnings.push("No SMDH icon in ExeFS.");
-  }
-
   const offsets: Offsets = {
-    ciaHeader: 0,
+    ciaHeader: headerSize,
     certSize,
     ticketSize,
     tmdSize,
@@ -207,11 +277,11 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
     footerInCode: footerStart,
     romInFile: codeOff + romStart,
   };
-  void headerSize;
 
   return {
     fileName,
     fileSize: data.length,
+    system: "gba",
     titleId,
     productCode,
     encrypted,
@@ -226,6 +296,67 @@ export function parseCia(buffer: ArrayBuffer, fileName = "title.cia"): Dossier {
     romSizeFieldTrusted: trusted,
     smdh,
     iconRgba,
+    warnings,
+  };
+}
+
+/**
+ * Creates a Dossier from a standalone Game Boy or Game Boy Color ROM file (.gb or .gbc).
+ */
+export function parseGbFile(buffer: ArrayBuffer | ArrayBufferLike, fileName: string): Dossier {
+  const bytes = new Uint8Array(buffer);
+  const gb = readGbHeader(bytes);
+  const system: SystemKind = gb.cgbOnly ? "gbc" : "gb";
+  const gba: GbaHeader = {
+    title: gb.title,
+    gameCode: gb.manufacturerCode || gb.title.replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(4, "-"),
+    maker: gb.newLicensee || "01",
+    version: gb.version,
+    checksum: gb.headerChecksum,
+    checksumOk: gb.checksumOk,
+    logoOk: gb.logoOk,
+  };
+
+  const offsets: Offsets = {
+    ciaHeader: 0,
+    certSize: 0,
+    ticketSize: 0,
+    tmdSize: 0,
+    metaSize: 0,
+    contentSize: bytes.length,
+    ncch: 0,
+    exefs: 0,
+    codeInFile: 0,
+    iconInFile: -1,
+    preambleInCode: 0,
+    romStartInCode: 0,
+    footerInCode: 0,
+    romInFile: 0,
+  };
+
+  const warnings: string[] = [];
+  if (!gb.checksumOk) warnings.push("Game Boy header checksum does not match.");
+  if (!gb.logoOk) warnings.push("Nintendo Game Boy logo at 0x104 does not match.");
+
+  return {
+    fileName,
+    fileSize: bytes.length,
+    system,
+    titleId: "0000000000000000",
+    productCode: gb.manufacturerCode || "DMG-GAME",
+    encrypted: false,
+    codeCompressed: false,
+    decompressed: false,
+    exefsNames: [],
+    offsets,
+    preambleBytes: 0,
+    gba,
+    gb,
+    caa: makeEmptyCaa(),
+    rom: bytes,
+    romSizeFieldTrusted: true,
+    smdh: null,
+    iconRgba: null,
     warnings,
   };
 }

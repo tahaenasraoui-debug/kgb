@@ -323,6 +323,7 @@ def parse_cia(data: bytes) -> dict:
         warnings.append("NCCH NoCrypto flag is clear. Payload is probably still encrypted.")
     exefs_media = u32(data, ncch + 0x1A0)
     exefs = ncch + exefs_media * 0x200
+    romfs_media = u32(data, ncch + 0x1B0) if ncch + 0x1B4 <= len(data) else 0
     code_compressed = False
     if ncch + 0x200 + 0x0D < exefs and ncch + 0x20D < len(data):
         code_compressed = (data[ncch + 0x20D] & 0x01) != 0
@@ -356,6 +357,8 @@ def parse_cia(data: bytes) -> dict:
             warnings.append(f"BLZ failed ({exc}). Scanning raw .code.")
     rom_start = find_rom_start(code)
     if rom_start is None:
+        if romfs_media > 0:
+            raise KgbError("No GBA cartridge header in .code. This CIA contains a RomFS partition (likely a GB/GBC, NES, or SNES emulator inject, not a GBA AGB_FIRM inject).")
         raise KgbError("No GBA cartridge header in .code.")
     found = find_caa_footer(code)
     if found is None:
