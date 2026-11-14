@@ -4,13 +4,21 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseCia } from "./parse.ts";
+import { fileURLToPath } from "node:url";
+
+const KGB_PY = fileURLToPath(new URL("../../../public/kgb.py", import.meta.url));
+import { parseCia, parseGbFile } from "./parse.ts";
 import { decodeRgb565Icon, encodeRgb565Icon } from "./smdh.ts";
-import { buildSyntheticCia, buildSyntheticRom, syntheticIconRgba } from "./synthetic.ts";
-import { trimTrailingFf } from "./format.ts";
+import { buildSyntheticCia, buildSyntheticGbCia, buildSyntheticGbRom, buildSyntheticRom, syntheticIconRgba } from "./synthetic.ts";
+import { sanitizeFile, trimTrailingFf } from "./format.ts";
+import { describeGbaSize } from "./validate.ts";
+import { gbaHeaderChecksum, readGbaHeader } from "./gba.ts";
+import { readGbHeader } from "./gb.ts";
+import { buildGoombaGba } from "./goomba.ts";
 import { blzDecompress } from "./blz.ts";
 import { crc16 } from "./crc16.ts";
-import { CARRIER_README, NDS_LOGO, installBannerIcon, packGbaAsNds, parseNds, runArm9Blit } from "./nds.ts";
+import { glyphRows5x7 } from "./font5x7.ts";
+import { CARRIER_README, NDS_LOGO, installBannerIcon, packGbaAsNds, parseNds, runArm9Blit, squareImage } from "./nds.ts";
 import { FRAME_BYTES } from "./screen.ts";
 
 test("synthetic CIA round-trips to the planted ROM", () => {
@@ -53,7 +61,7 @@ test("python CLI extracts the TypeScript synthetic CIA", () => {
   const dir = mkdtempSync(join(tmpdir(), "kgb-"));
   const ciaPath = join(dir, "sample.cia");
   writeFileSync(ciaPath, cia);
-  execFileSync("python3", ["/workspace/public/kgb.py", ciaPath, "-o", dir], { encoding: "utf8" });
+  execFileSync("python3", [KGB_PY, ciaPath, "-o", dir], { encoding: "utf8" });
   const extracted = readFileSync(join(dir, "KGB DOSSIER [KGBE].gba"));
   assert.equal(Buffer.compare(extracted, Buffer.from(buildSyntheticRom())), 0);
   const report = JSON.parse(readFileSync(join(dir, "KGB DOSSIER [KGBE].caa.json"), "utf8"));
@@ -65,7 +73,7 @@ test("python CLI extracts the TypeScript synthetic CIA", () => {
 test("TypeScript parses a Python synthetic CIA", () => {
   const dir = mkdtempSync(join(tmpdir(), "kgb-py-"));
   const ciaPath = join(dir, "py.cia");
-  execFileSync("python3", ["/workspace/public/kgb.py", "--synth", ciaPath]);
+  execFileSync("python3", [KGB_PY, "--synth", ciaPath]);
   const buf = readFileSync(ciaPath);
   const dossier = parseCia(Uint8Array.from(buf).buffer, "py.cia");
   assert.equal(dossier.gba.gameCode, "KGBE");
@@ -75,7 +83,9 @@ test("TypeScript parses a Python synthetic CIA", () => {
 });
 
 test("BLZ round-trip matches python", () => {
-  const compressed = execFileSync("python3", ["-c", "import importlib.util; p=importlib.util.spec_from_file_location('kgb','/workspace/public/kgb.py'); m=importlib.util.module_from_spec(p); p.loader.exec_module(m); import sys; sys.stdout.buffer.write(m.blz_compress_literals(b'KGB!'*64))"]);
+  const pyPath = KGB_PY.replace(/\\/g, "/");
+  const pyCmd = `import importlib.util; p=importlib.util.spec_from_file_location('kgb','${pyPath}'); m=importlib.util.module_from_spec(p); p.loader.exec_module(m); import sys; sys.stdout.buffer.write(m.blz_compress_literals(b'KGB!'*64))`;
+  const compressed = execFileSync("python3", ["-c", pyCmd]);
   const out = blzDecompress(new Uint8Array(compressed));
   assert.equal(new TextDecoder().decode(out), "KGB!".repeat(64));
 });
@@ -189,6 +199,124 @@ test("a picture can be written into the NDS header banner", () => {
   assert.equal(again.bannerOffset, iconInfo.bannerOffset);
   assert.ok(again.iconRgba);
   assert.ok(again.iconRgba[1]! > 150);
-  assert.deepEqual(again.gba?.rom, rom);
+    assert.deepEqual(again.gba?.rom, rom);
 });
 
+test("shared 5x7 font covers the NDS stamp charset", () => {
+  for (const ch of "GBAX0123456789") {
+    const rows = glyphRows5x7(ch);
+    assert.equal(rows.length, 7);
+    assert.ok(rows.every((r) => r >= 0 && r <= 0b11111));
+  }
+  // Unknown glyphs fall back to the box, matching the old NDS behavior.
+  assert.deepEqual(glyphRows5x7("€"), glyphRows5x7("~"));
+});
+
+test("header checksum accepts an explicit offset", () => {
+  const rom = buildSyntheticRom();
+  const padded = new Uint8Array(rom.length + 0x2000);
+  padded.set(rom, 0x2000);
+  assert.equal(gbaHeaderChecksum(padded, 0x2000), gbaHeaderChecksum(rom));
+});
+
+test("trim keeps ROMs with no trailing FF intact", () => {
+  const dense = new Uint8Array(0xc0).fill(0x11);
+  const { bytes, trimmed } = trimTrailingFf(dense);
+  assert.equal(trimmed, 0);
+  assert.equal(bytes.length, dense.length);
+  // A ROM that is all padding except the header is left at the header floor.
+  const tiny = new Uint8Array(0xd0).fill(0xff);
+  assert.equal(trimTrailingFf(tiny).bytes.length, 0xc0);
+});
+
+test("sanitizeFile never splits a surrogate pair", () => {
+  const name = sanitizeFile("ポケットモンスター エメラルド".repeat(10));
+  assert.ok(name.length <= 80);
+  assert.ok(!/\uFFFD/.test(name));
+  assert.equal(sanitizeFile(""), "extracted");
+  assert.equal(sanitizeFile("a/b\\c:d"), "a b c d");
+});
+
+test("squareImage rejects non-square and tiny buffers", () => {
+  assert.equal(squareImage(null), null);
+  assert.equal(squareImage(new Uint8ClampedArray(10)), null);
+  const rect = new Uint8ClampedArray(8 * 16 * 4);
+  assert.equal(squareImage(rect), null);
+  const ok = squareImage(new Uint8ClampedArray(8 * 8 * 4));
+  assert.equal(ok?.width, 8);
+});
+
+test("packing rejects files smaller than a GBA header", () => {
+  assert.throws(() => packGbaAsNds({ rom: new Uint8Array(0xbf) }), /too small/);
+});
+
+test("NATIVE banner v2/v3 CRCs are verified", () => {
+  const nds = packGbaAsNds({ rom: buildSyntheticRom() });
+  const info = parseNds(nds, "carrier.nds");
+  assert.equal(info.bannerVersion, 1);
+  assert.equal(info.bannerCrcOk, true);
+  assert.ok(info.arm9Size > 0 && info.arm7Size > 0);
+  assert.ok(info.fntSize > 0 && info.fatSize > 0);
+});
+
+test("installBannerIcon rejects non-NDS input", () => {
+  assert.throws(
+    () => installBannerIcon(buildSyntheticRom(), { rgba: syntheticIconRgba(), width: 48, height: 48 }),
+    /Not an NDS cartridge/,
+  );
+});
+
+test("describeGbaSize distinguishes licensed, overdump, and non-standard sizes", () => {
+  assert.equal(describeGbaSize(4 * 1024 * 1024).ok, true);
+  assert.equal(describeGbaSize(4 * 1024 * 1024).detail, "Licensed cartridge size");
+  assert.equal(describeGbaSize(32 * 1024 * 1024).ok, true);
+  assert.equal(describeGbaSize(32 * 1024 * 1024).detail, "Licensed cartridge size");
+  assert.equal(describeGbaSize(64 * 1024 * 1024).ok, false);
+  assert.ok(describeGbaSize(64 * 1024 * 1024).detail.includes("overdump"));
+  assert.equal(describeGbaSize(256).ok, true);
+  assert.ok(describeGbaSize(256).detail.includes("trimmed or homebrew size"));
+});
+
+test("Game Boy VC CIA extracts GB ROM from RomFS", () => {
+  const cia = buildSyntheticGbCia("KIRBY DREAM2", false);
+  const dossier = parseCia(Uint8Array.from(cia).buffer, "Kirby's Dream Land 2.cia");
+  assert.equal(dossier.system, "gb");
+  assert.equal(dossier.rom.length, 32768);
+  assert.ok(dossier.gb);
+  assert.equal(dossier.gb.title, "KIRBY DREAM2");
+  assert.equal(dossier.gb.cartridgeTypeName, "MBC1+RAM+BATTERY");
+  assert.equal(dossier.gb.checksumOk, true);
+  assert.equal(dossier.gb.logoOk, true);
+  assert.equal(dossier.gb.cgbOnly, false);
+});
+
+test("Game Boy Color VC CIA extracts GBC ROM from RomFS", () => {
+  const cia = buildSyntheticGbCia("POKEMON CRYS", true);
+  const dossier = parseCia(Uint8Array.from(cia).buffer, "Pokemon Crystal.cia");
+  assert.equal(dossier.system, "gbc");
+  assert.ok(dossier.gb);
+  assert.equal(dossier.gb.cgbOnly, true);
+  assert.equal(dossier.gb.cgbSupported, true);
+  assert.equal(dossier.gb.checksumOk, true);
+});
+
+test("parseGbFile parses a standalone .gb ROM", () => {
+  const rom = buildSyntheticGbRom("ZELDA LA", false);
+  const dossier = parseGbFile(rom.buffer, "zelda.gb");
+  assert.equal(dossier.system, "gb");
+  assert.equal(dossier.rom.length, 32768);
+  assert.equal(dossier.gb?.title, "ZELDA LA");
+  assert.equal(dossier.gb?.checksumOk, true);
+});
+
+test("Goomba Color bundles GB ROM into playable GBA image", () => {
+  const goombaPath = fileURLToPath(new URL("../../../public/goomba.gba", import.meta.url));
+  const goombaBase = new Uint8Array(readFileSync(goombaPath));
+  const gbRom = buildSyntheticGbRom("KIRBY DREAM2", false);
+  const gba = buildGoombaGba(goombaBase, gbRom, "KIRBY DREAM2");
+  assert.equal(gba.length, goombaBase.length + gbRom.length);
+  const header = readGbaHeader(gba);
+  assert.equal(header.title, "KIRBYDREAM2");
+  assert.equal(header.checksumOk, true);
+  assert.equal(header.logoOk, true);
+});

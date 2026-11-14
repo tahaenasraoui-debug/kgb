@@ -43,9 +43,21 @@ Build:
 
 ```
 npm run build
+npm run typecheck
+npm test
 ```
 
-`npm run build` produces a server build in `.vercel/output`, not a static folder. It cannot be dropped onto GitHub Pages as is. Preview it with `npx vite preview`.
+`npm run build` produces a server build in `.vercel/output`, not a static folder. Preview the production output with `npm run preview:restart` (serves `127.0.0.1:8081`).
+
+## Notes
+
+- Browsers: any recent Chrome, Edge, Firefox, or Safari. `crypto.subtle` needs a secure context; `file://` will show SHA-256 as unavailable.
+- Limits: one file at a time up to 256 MiB; up to 20 files queue up. Heavy CIA parsing and NDS packing run in a Web Worker so the UI stays responsive, with Cancel.
+- Encrypted CIAs: KGB only reads NoCrypto injects. Rebuild as NoCrypto with vcoven or NSUI (decrypt personal dumps with GodMode9 first). The error panel still shows whatever the tool could read (title ID, product code, ExeFS names).
+- GBA size check: licensed cartridges are 4/8/16/32 MiB powers of two. Anything over 32 MiB is flagged as a likely overdump.
+- NDS extras: cartridge layout (ARM9/ARM7/FNT/FAT/banners, banner v2/v3 CRCs), per-file extraction (files over 8 MiB are skipped in the browser view), and sequential Download-all.
+- Works offline after first load (pure client-side; the only network fetch is `kgb.py` for the Script tab). Files stay in the browser. Nothing is uploaded.
+- No accounts, no tracking, no telemetry — that is intentional.
 
 ## License
 

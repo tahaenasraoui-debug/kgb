@@ -85,7 +85,7 @@ function readBlock(data: Uint8Array, base: number): { short: string; long: strin
   };
 }
 
-export function parseSmdh(data: Uint8Array): { titles: SmdhTitles; icon: Uint8ClampedArray } | null {
+export function parseSmdh(data: Uint8Array): { titles: SmdhTitles; icon: Uint8ClampedArray | null } | null {
   if (data.length < 4) return null;
   if (data[0] !== 0x53 || data[1] !== 0x4d || data[2] !== 0x44 || data[3] !== 0x48) return null;
   let chosen: SmdhTitles | null = null;
@@ -107,7 +107,7 @@ export function parseSmdh(data: Uint8Array): { titles: SmdhTitles; icon: Uint8Cl
   if (data.length >= LARGE_ICON_OFFSET + LARGE_ICON_BYTES) {
     icon = decodeRgb565Icon(data.subarray(LARGE_ICON_OFFSET, LARGE_ICON_OFFSET + LARGE_ICON_BYTES), 48);
   }
-  return { titles: chosen, icon: icon ?? new Uint8ClampedArray(48 * 48 * 4) };
+  return { titles: chosen, icon };
 }
 
 export function writeUtf16(target: Uint8Array, offset: number, byteLen: number, text: string) {

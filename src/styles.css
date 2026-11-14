@@ -1,6 +1,8 @@
 @import url("https://fonts.googleapis.com/css2?family=Nunito:wght@600;700;800&display=swap");
 @import "tailwindcss";
 
+/* Preconnect hints for the only third-party origin (font). See __root.tsx. */
+
 @theme {
   --color-sky: #8fd4f8;
   --color-field: #fffdf6;

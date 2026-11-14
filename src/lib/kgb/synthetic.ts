@@ -1,5 +1,6 @@
 import { gbaHeaderChecksum, GBA_LOGO_16 } from "./gba.ts";
 import { encodeRgb565Icon, SMDH_SIZE, writeUtf16 } from "./smdh.ts";
+import { GB_LOGO } from "./gb.ts";
 
 export const SYNTH_ROM_SIZE = 0x400;
 export const SYNTH_PREAMBLE = 0x2000;
@@ -64,6 +65,74 @@ export function buildSyntheticRom(): Uint8Array {
   return rom;
 }
 
+export function buildSyntheticGbRom(title = "KIRBY DREAM2", cgbMode = false): Uint8Array {
+  const rom = new Uint8Array(32768);
+  rom[0x100] = 0x00;
+  rom[0x101] = 0xc3;
+  rom[0x102] = 0x50;
+  rom[0x103] = 0x01;
+  rom.set(GB_LOGO, 0x104);
+  putAscii(rom, 0x134, title.padEnd(16, " "));
+  rom[0x143] = cgbMode ? 0xc0 : 0x00;
+  putAscii(rom, 0x144, "01");
+  rom[0x147] = 0x03; // MBC1+RAM+BATTERY
+  rom[0x148] = 0x00; // 32 KiB
+  rom[0x149] = 0x01; // 2 KiB RAM
+  rom[0x14a] = 0x01; // Non-Japan
+  let chk = 0;
+  for (let i = 0x134; i <= 0x14c; i++) {
+    chk = (chk - rom[i]! - 1) & 0xff;
+  }
+  rom[0x14d] = chk;
+  for (let i = 0x150; i < rom.length; i++) {
+    rom[i] = (i * 31 + 7) & 0xff;
+  }
+  return rom;
+}
+
+export function buildSyntheticRomfs(gbRom: Uint8Array): Uint8Array {
+  const level3Off = 0x1000;
+  const fileDataRel = 0x200;
+  const level3Size = alignUp(fileDataRel + gbRom.length, 0x200);
+  const total = level3Off + level3Size;
+  const romfs = new Uint8Array(total);
+
+  // IVFC Header
+  putAscii(romfs, 0, "IVFC");
+  putU32(romfs, 0x04, 0x10000);
+  putU32(romfs, 0x3c, level3Off);
+  putU32(romfs, 0x44, level3Size);
+
+  // Level 3 Header
+  const l3 = level3Off;
+  putU32(romfs, l3 + 0x00, 0x28);
+  putU32(romfs, l3 + 0x04, 0x28);
+  putU32(romfs, l3 + 0x08, 0x10);
+  putU32(romfs, l3 + 0x0c, 0x38);
+  putU32(romfs, l3 + 0x10, 0x20);
+  putU32(romfs, l3 + 0x14, 0x58);
+  putU32(romfs, l3 + 0x18, 0x10);
+  putU32(romfs, l3 + 0x1c, 0x68);
+  putU32(romfs, l3 + 0x20, 0x40);
+  putU32(romfs, l3 + 0x24, fileDataRel);
+
+  // File metadata entry
+  const fm = l3 + 0x68;
+  putU32(romfs, fm + 0x00, 0);
+  putU32(romfs, fm + 0x04, 0xffffffff);
+  putU32(romfs, fm + 0x08, 0);
+  putU32(romfs, fm + 0x0c, 0);
+  putU32(romfs, fm + 0x10, gbRom.length);
+  putU32(romfs, fm + 0x14, 0);
+  putU32(romfs, fm + 0x18, 0);
+  putU32(romfs, fm + 0x1c, 6);
+  writeUtf16(romfs, fm + 0x20, 6, "rom");
+
+  // Write ROM
+  romfs.set(gbRom, l3 + fileDataRel);
+  return romfs;
+}
+
 function buildLut(): Uint8Array {
   const lut = new Uint8Array(0x300);
   for (let i = 0; i < 256; i++) {
@@ -95,14 +164,14 @@ export function buildCaaFooter(romSize: number, codeBeforeFooter: number): Uint8
   return footer;
 }
 
-function buildSmdh(): Uint8Array {
+function buildSmdh(title = "KGB TEST", shortDesc = "Kernel GBA Boy", publisher = "KGB ARCHIVES"): Uint8Array {
   const smdh = new Uint8Array(SMDH_SIZE);
   putAscii(smdh, 0, "SMDH");
   for (const idx of [0, 1]) {
     const base = 0x8 + idx * 0x200;
-    writeUtf16(smdh, base, 0x80, "KGB TEST");
-    writeUtf16(smdh, base + 0x80, 0x100, "Kernel GBA Boy");
-    writeUtf16(smdh, base + 0x180, 0x80, "KGB ARCHIVES");
+    writeUtf16(smdh, base, 0x80, title);
+    writeUtf16(smdh, base + 0x80, 0x100, shortDesc);
+    writeUtf16(smdh, base + 0x180, 0x80, publisher);
   }
   const icon = encodeRgb565Icon(syntheticIconRgba(), 48);
   smdh.set(icon, 0x24c0);
@@ -187,5 +256,82 @@ export function buildSyntheticCia(): Uint8Array {
   putU32(file, exefs + 16 + 12, smdh.length);
   file.set(code, exefs + 0x200);
   file.set(smdh, exefs + 0x200 + codeAligned);
+  return file;
+}
+
+/** Spec-compliant synthetic Game Boy Virtual Console CIA with RomFS partition containing the game ROM. */
+export function buildSyntheticGbCia(title = "KIRBY DREAM2", cgbMode = false): Uint8Array {
+  const gbRom = buildSyntheticGbRom(title, cgbMode);
+  const romfs = buildSyntheticRomfs(gbRom);
+
+  // ExeFS .code contains emulator stub
+  const code = new Uint8Array(0x1000);
+  putAscii(code, 0, "GAMEBOY EMULATOR VC");
+
+  const smdh = buildSmdh(title, "Game Boy VC", "Nintendo / HAL");
+  const codeAligned = alignUp(code.length, 0x200);
+  const exefsBody = codeAligned + smdh.length;
+  const exefsTotal = alignUp(0x200 + exefsBody, 0x200);
+
+  const exheader = new Uint8Array(0x800);
+  putAscii(exheader, 0, "GbEmulator");
+  const ncchHead = 0x200;
+  const exefsMedia = (ncchHead + exheader.length) / 0x200;
+  const romfsMedia = exefsMedia + exefsTotal / 0x200;
+  const romfsSize = alignUp(romfs.length, 0x200);
+  const ncchSize = ncchHead + exheader.length + exefsTotal + romfsSize;
+
+  const headerSize = 0x2020;
+  const certSize = 0x40;
+  const ticketSize = 0x40;
+  const tmdSize = 0x40;
+  const ncchOff = align64(headerSize) + align64(certSize) + align64(ticketSize) + align64(tmdSize);
+  const fileSize = ncchOff + ncchSize;
+  const file = new Uint8Array(fileSize);
+
+  putU32(file, 0x00, headerSize);
+  putU32(file, 0x08, certSize);
+  putU32(file, 0x0c, ticketSize);
+  putU32(file, 0x10, tmdSize);
+  putU32(file, 0x14, 0);
+  putU32(file, 0x18, ncchSize);
+  file[0x20] = 0x80;
+
+  putAscii(file, align64(headerSize), "CERT");
+  putAscii(file, align64(headerSize) + align64(certSize), "TICK");
+  putAscii(file, align64(headerSize) + align64(certSize) + align64(ticketSize), "TMD!");
+
+  const ncch = ncchOff;
+  putAscii(file, ncch + 0x100, "NCCH");
+  putU32(file, ncch + 0x104, ncchSize / 0x200);
+  putU32(file, ncch + 0x108, 0x004b4742);
+  putU32(file, ncch + 0x10c, 0x00040000); // regular app / VC
+  putAscii(file, ncch + 0x110, "01");
+  putU32(file, ncch + 0x118, 0x004b4742);
+  putU32(file, ncch + 0x11c, 0x00040000);
+  putAscii(file, ncch + 0x150, cgbMode ? "CTR-P-KGB-GBC" : "CTR-P-KGB-GB");
+  putU32(file, ncch + 0x180, 0x400);
+  file[ncch + 0x18d] = 0x02;
+  file[ncch + 0x18f] = 0x04; // NoCrypto flag
+  putU32(file, ncch + 0x1a0, exefsMedia);
+  putU32(file, ncch + 0x1a4, exefsTotal / 0x200);
+  putU32(file, ncch + 0x1a8, 1);
+  putU32(file, ncch + 0x1b0, romfsMedia);
+  putU32(file, ncch + 0x1b4, romfsSize / 0x200);
+
+  file.set(exheader, ncch + ncchHead);
+
+  const exefs = ncch + ncchHead + exheader.length;
+  putAscii(file, exefs, ".code");
+  putU32(file, exefs + 8, 0);
+  putU32(file, exefs + 12, code.length);
+  putAscii(file, exefs + 16, "icon");
+  putU32(file, exefs + 16 + 8, codeAligned);
+  putU32(file, exefs + 16 + 12, smdh.length);
+  file.set(code, exefs + 0x200);
+  file.set(smdh, exefs + 0x200 + codeAligned);
+
+  // Set RomFS
+  file.set(romfs, ncch + romfsMedia * 0x200);
   return file;
 }
