@@ -60,7 +60,8 @@ export function utf16le(data: Uint8Array, start: number, bytes: number): string 
 }
 
 export function sanitizeFile(name: string): string {
-  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
+  const noControls = Array.from(name, (ch) => (ch.charCodeAt(0) <= 0x1f ? " " : ch)).join("");
+  const cleaned = noControls.replace(/[<>:"/\\|?*]/g, " ").replace(/\s+/g, " ").trim();
   return cleaned.length > 0 ? cleaned.slice(0, 80) : "extracted";
 }
 

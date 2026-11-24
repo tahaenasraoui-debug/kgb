@@ -189,6 +189,7 @@ export function KgbApp() {
 
   function fail(err: unknown) {
     setLoaded(null);
+    setTab("dossier");
     if (err instanceof KgbError) {
       setError(err.message);
       setErrorNotes(err.warnings);
@@ -224,9 +225,14 @@ export function KgbApp() {
     }
   }
 
-  function onFile(file: File | undefined) {
+  async function onFile(file: File | undefined) {
     if (!file) return;
-    file.arrayBuffer().then((buf) => ingest(buf, file.name));
+    try {
+      const buf = await file.arrayBuffer();
+      ingest(buf, file.name);
+    } catch (err) {
+      fail(err);
+    }
   }
 
   function saveRom() {
@@ -328,7 +334,7 @@ export function KgbApp() {
           onDrop={(event) => {
             event.preventDefault();
             setDragOver(false);
-            onFile(event.dataTransfer.files[0]);
+            void onFile(event.dataTransfer.files[0]);
           }}
         >
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -345,7 +351,11 @@ export function KgbApp() {
               accept=".cia,.cxi,.app,.gba,.agb,.nds,.srl,application/octet-stream"
               className="sr-only"
               suppressHydrationWarning
-              onChange={(event) => onFile(event.target.files?.[0])}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                void onFile(file);
+              }}
             />
           </div>
         </section>

@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import { test } from "node:test";
 import { parseCia } from "./parse.ts";
 import { decodeRgb565Icon, encodeRgb565Icon } from "./smdh.ts";
 import { buildSyntheticCia, buildSyntheticRom, syntheticIconRgba } from "./synthetic.ts";
-import { trimTrailingFf } from "./format.ts";
+import { sanitizeFile, trimTrailingFf } from "./format.ts";
 import { blzDecompress } from "./blz.ts";
 import { crc16 } from "./crc16.ts";
 import { CARRIER_README, NDS_LOGO, installBannerIcon, packGbaAsNds, parseNds, runArm9Blit } from "./nds.ts";
 import { FRAME_BYTES } from "./screen.ts";
+
+const KGB_PY = path.resolve(process.cwd(), "public/kgb.py");
 
 test("synthetic CIA round-trips to the planted ROM", () => {
   const cia = buildSyntheticCia();
@@ -51,33 +53,50 @@ test("SMDH icon survives Morton encode", () => {
 test("python CLI extracts the TypeScript synthetic CIA", () => {
   const cia = buildSyntheticCia();
   const dir = mkdtempSync(join(tmpdir(), "kgb-"));
-  const ciaPath = join(dir, "sample.cia");
-  writeFileSync(ciaPath, cia);
-  execFileSync("python3", ["/workspace/public/kgb.py", ciaPath, "-o", dir], { encoding: "utf8" });
-  const extracted = readFileSync(join(dir, "KGB DOSSIER [KGBE].gba"));
-  assert.equal(Buffer.compare(extracted, Buffer.from(buildSyntheticRom())), 0);
-  const report = JSON.parse(readFileSync(join(dir, "KGB DOSSIER [KGBE].caa.json"), "utf8"));
-  assert.equal(report.caa.save_type, 4);
-  assert.equal(report.caa.rtc, true);
-  assert.equal(report.preamble_bytes, 0x2000);
+  try {
+    const ciaPath = join(dir, "sample.cia");
+    writeFileSync(ciaPath, cia);
+    execFileSync("python3", [KGB_PY, ciaPath, "-o", dir], { encoding: "utf8" });
+    const extracted = readFileSync(join(dir, "KGB DOSSIER [KGBE].gba"));
+    assert.equal(Buffer.compare(extracted, Buffer.from(buildSyntheticRom())), 0);
+    const report = JSON.parse(readFileSync(join(dir, "KGB DOSSIER [KGBE].caa.json"), "utf8"));
+    assert.equal(report.caa.save_type, 4);
+    assert.equal(report.caa.rtc, true);
+    assert.equal(report.preamble_bytes, 0x2000);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("TypeScript parses a Python synthetic CIA", () => {
   const dir = mkdtempSync(join(tmpdir(), "kgb-py-"));
-  const ciaPath = join(dir, "py.cia");
-  execFileSync("python3", ["/workspace/public/kgb.py", "--synth", ciaPath]);
-  const buf = readFileSync(ciaPath);
-  const dossier = parseCia(Uint8Array.from(buf).buffer, "py.cia");
-  assert.equal(dossier.gba.gameCode, "KGBE");
-  assert.equal(dossier.preambleBytes, 0x2000);
-  assert.equal(dossier.caa.save.rtc, true);
-  assert.equal(dossier.smdh?.publisher, "KGB ARCHIVES");
+  try {
+    const ciaPath = join(dir, "py.cia");
+    execFileSync("python3", [KGB_PY, "--synth", ciaPath]);
+    const buf = readFileSync(ciaPath);
+    const dossier = parseCia(Uint8Array.from(buf).buffer, "py.cia");
+    assert.equal(dossier.gba.gameCode, "KGBE");
+    assert.equal(dossier.preambleBytes, 0x2000);
+    assert.equal(dossier.caa.save.rtc, true);
+    assert.equal(dossier.smdh?.publisher, "KGB ARCHIVES");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("BLZ round-trip matches python", () => {
-  const compressed = execFileSync("python3", ["-c", "import importlib.util; p=importlib.util.spec_from_file_location('kgb','/workspace/public/kgb.py'); m=importlib.util.module_from_spec(p); p.loader.exec_module(m); import sys; sys.stdout.buffer.write(m.blz_compress_literals(b'KGB!'*64))"]);
+  const compressed = execFileSync("python3", [
+    "-c",
+    "import importlib.util, sys; p=importlib.util.spec_from_file_location('kgb', sys.argv[1]); m=importlib.util.module_from_spec(p); p.loader.exec_module(m); sys.stdout.buffer.write(m.blz_compress_literals(b'KGB!'*64))",
+    KGB_PY,
+  ]);
   const out = blzDecompress(new Uint8Array(compressed));
   assert.equal(new TextDecoder().decode(out), "KGB!".repeat(64));
+});
+
+test("sanitizeFile strips control characters and unsafe filename symbols", () => {
+  assert.equal(sanitizeFile("KGB\u0000:Test/ROM\u001f?*"), "KGB Test ROM");
+  assert.equal(sanitizeFile("\u0000\u0001<>"), "extracted");
 });
 
 test("NDS logo CRC is the BIOS constant", () => {
