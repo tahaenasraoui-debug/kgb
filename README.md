@@ -5,6 +5,7 @@
 **GBA ROMs out of 3DS Virtual Console `.cia` files, packed into DS `.nds` files, all in your browser.**
 
 [![CI](https://github.com/tahaenasraoui-debug/kgb/actions/workflows/ci.yml/badge.svg)](https://github.com/tahaenasraoui-debug/kgb/actions/workflows/ci.yml)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Vercel-000000?logo=vercel)](https://kgb-theta.vercel.app)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -12,6 +13,8 @@
 Get a GBA ROM out of a Nintendo 3DS Virtual Console `.cia`, pack that ROM into a Nintendo DS `.nds`, or change the icon on a DS file.
 
 Files stay in the browser. Nothing is uploaded.
+
+**Live App:** [kgb-theta.vercel.app](https://kgb-theta.vercel.app)
 
 ![KGB screenshot](assets/image.png)
 
